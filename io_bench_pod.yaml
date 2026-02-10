@@ -6,6 +6,8 @@ metadata:
     app: io-benchmark
     owner: rotemshavitt
 spec:
+  securityContext:
+    runAsUser: 0
   containers:
   - name: python-benchmarking
     image: pytorch/pytorch:latest 
@@ -19,11 +21,13 @@ spec:
       sleep infinity
     resources:
       requests:
-        memory: "100Gi"
+        memory: "300Gi"
         cpu: "12"
+        nvidia.com/gpu: "1"
       limits:
-        memory: "200Gi"
+        memory: "300Gi"
         cpu: "128"
+        nvidia.com/gpu: "1"
     volumeMounts:
     - mountPath: /dev/shm
       name: dshm
@@ -31,4 +35,4 @@ spec:
   - name: dshm
     emptyDir:
       medium: Memory
-      sizeLimit: "100Gi" # Adjust based on 'buffer_size' variable
+      sizeLimit: "200Gi" # Adjust based on 'buffer_size' variable

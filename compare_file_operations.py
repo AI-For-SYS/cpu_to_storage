@@ -1,6 +1,6 @@
 import asyncio
 from sys import implementation
-from typing import Any
+from typing import Any, Optional
 from concurrent.futures import ThreadPoolExecutor
 import aiofiles
 import aiofiles.os  # Required for the atomic replace
@@ -8,9 +8,11 @@ import time
 import os
 import statistics
 from numpy import block
+from sympy import im
 import torch
 import random
 import json
+from pathlib import Path
 
 # Import C++ extension for high-performance file I/O
 try:
@@ -20,6 +22,106 @@ except ImportError as e:
     print(f"Warning: C++ extension not available: {e}")
     print("Run 'python setup.py build_ext --inplace' in compare_file_operations/ to build it")
     CPP_AVAILABLE = False
+
+# Helper functions for incremental result saving and resumption
+def save_incremental_results(output_file: str, results: dict, append: bool = False):
+    """Save results incrementally to a JSON file.
+    
+    Args:
+        output_file: Path to the output JSON file
+        results: Dictionary containing the results to save
+        append: If True, merge with existing results (for resumption)
+    """
+    os.makedirs(os.path.dirname(output_file), exist_ok=True)
+    
+    if append and os.path.exists(output_file):
+        try:
+            with open(output_file, 'r') as f:
+                existing_results = json.load(f)
+            # Merge results - this will overwrite existing keys
+            for key in results:
+                if key in existing_results and isinstance(existing_results[key], dict) and isinstance(results[key], dict):
+                    existing_results[key].update(results[key])
+                else:
+                    existing_results[key] = results[key]
+            results = existing_results
+        except (json.JSONDecodeError, IOError) as e:
+            print(f"Warning: Could not load existing results from {output_file}: {e}")
+    
+    # Write atomically using a temporary file
+    temp_file = output_file + '.tmp'
+    with open(temp_file, 'w') as f:
+        json.dump(results, f, indent=2)
+    os.replace(temp_file, output_file)
+
+def load_existing_results(output_file: str) -> Optional[dict]:
+    """Load existing results from a JSON file if it exists.
+    
+    Args:
+        output_file: Path to the output JSON file
+        
+    Returns:
+        Dictionary containing existing results, or None if file doesn't exist or is invalid
+    """
+    if not os.path.exists(output_file):
+        return None
+    
+    try:
+        with open(output_file, 'r') as f:
+            results = json.load(f)
+        return results
+    except (json.JSONDecodeError, IOError) as e:
+        print(f"Warning: Could not load existing results from {output_file}: {e}")
+        return None
+
+def check_config_match(existing_config: dict, new_config: dict) -> bool:
+    """Check if the configuration of existing results matches the new benchmark config.
+    
+    Args:
+        existing_config: Configuration from existing results
+        new_config: Configuration for the new benchmark
+        
+    Returns:
+        True if configurations match, False otherwise
+    """
+    # Compare key configuration parameters
+    key_params = ['buffer_size', 'num_iterations', 'block_sizes_mb', 'thread_counts', 
+                  'num_blocks', 'total_data_size_gb', 'implementation']
+    
+    for param in key_params:
+        if param in new_config:
+            if param not in existing_config:
+                return False
+            if existing_config[param] != new_config[param]:
+                return False
+    
+    return True
+
+def get_completed_tests(results: dict, test_type: str) -> set:
+    """Get the set of completed test combinations from existing results.
+    
+    Args:
+        results: Dictionary containing existing results
+        test_type: Either 'write' or 'read'
+        
+    Returns:
+        Set of tuples representing completed (thread_count, block_size) combinations
+    """
+    completed = set()
+    
+    if test_type not in results:
+        return completed
+    
+    test_results = results[test_type]
+    
+    # Handle different result structures
+    for key1, value1 in test_results.items():
+        if isinstance(value1, dict):
+            for key2 in value1.keys():
+                completed.add((key1, key2))
+    
+    return completed
+
 
 VERIFY = True
 
@@ -97,6 +199,7 @@ async def aiofiles_write_blocks(block_size, buffer, block_indices, dest_files):
         for i,(result, block_inx) in enumerate(zip(results,block_indices)):
             if not result or not verify_file(view[block_inx*block_size: (block_inx+1)*block_size], dest_files[i]):
                 print(f"Writing block {block_inx} with aiofiles Failed")
+                return
     return (end -start)
 
 
@@ -287,9 +390,45 @@ async def block_size_comparison_total(total_gb, iterations, buffer_size):
     print(f"Fixed total data size per test: {total_gb} GB)")
     print(f"Iterations per test: {iterations}\n")
     
+    # Prepare output file path
+    output_file = f'results/block_size_comparison_{total_gb}gb_zeros.json'
+    
+    # Check for existing results
+    existing_results = load_existing_results(output_file)
+    
     # Store results - structure: results[block_size][thread_count] = time
     write_results = {}
     read_results = {}
+    
+    # Configuration for this benchmark
+    config = {
+        'buffer_size': buffer_size,
+        'num_iterations': iterations,
+        'total_data_size_gb': total_gb,
+        'thread_counts': thread_counts,
+        'block_sizes_mb': block_sizes_mb,
+        'file_system': 'tmpfs (/dev/shm)',
+        'implementation': 'Python aiofiles'
+    }
+    
+    # Check if we can resume from existing results
+    completed_write = set()
+    completed_read = set()
+    
+    if existing_results and 'config' in existing_results:
+        if check_config_match(existing_results['config'], config):
+            print(f"Found existing results with matching configuration!")
+            print(f"Resuming benchmark from previous state...\n")
+            write_results = existing_results.get('write', {})
+            read_results = existing_results.get('read', {})
+            completed_write = get_completed_tests(existing_results, 'write')
+            completed_read = get_completed_tests(existing_results, 'read')
+            print(f"Already completed: {len(completed_write)} write tests, {len(completed_read)} read tests")
+        else:
+            print(f"Existing results found but configuration doesn't match.")
+            print(f"Starting fresh benchmark...\n")
+    else:
+        print(f"No existing results found. Starting fresh benchmark...\n")
     
     # Allocate buffer once
     num_elements = buffer_size // 2
@@ -309,12 +448,22 @@ async def block_size_comparison_total(total_gb, iterations, buffer_size):
         print(f"Block Size: {block_size_mb:.0f}MB | Blocks to copy: {num_blocks_to_copy} | Total: {total_gb}GB")
         print(f"{'='*80}")
         block_size = block_size_mb * 1024 * 1024
-        write_results[str(block_size)] = {}
-        read_results[str(block_size)] = {}
+        
+        if str(block_size) not in write_results:
+            write_results[str(block_size)] = {}
+        if str(block_size) not in read_results:
+            read_results[str(block_size)] = {}
         
         # INNER LOOP: Thread counts
         for num_threads in thread_counts:
             combination_count += 1
+            
+            # Check if this combination is already completed
+            test_key = (str(block_size), str(num_threads))
+            if test_key in completed_write and test_key in completed_read:
+                print(f"\n  [{combination_count}/{total_combinations}] Threads: {num_threads} - SKIPPED (already completed)")
+                continue
+            
             print(f"\n  [{combination_count}/{total_combinations}] Threads: {num_threads}")
             
             # Set up thread pool executor
@@ -364,26 +513,24 @@ async def block_size_comparison_total(total_gb, iterations, buffer_size):
             
             print(f"    Write: {avg_write*1000:.2f}ms ({write_throughput:.2f} GB/s)")
             print(f"    Read:  {avg_read*1000:.2f}ms ({read_throughput:.2f} GB/s)")
+            
+            # Save results incrementally after each test
+            current_results = {
+                'write': write_results,
+                'read': read_results,
+                'config': config
+            }
+            save_incremental_results(output_file, current_results)
+            print(f"    Results saved to {output_file}")
     
-    # Combine results
+    # Final save with complete results
     all_results = {
         'write': write_results,
         'read': read_results,
-        'config': {
-            'buffer_size': buffer_size,
-            'num_iterations': iterations,
-            'total_data_size_gb': total_gb,
-            'thread_counts': thread_counts,
-            'block_sizes_mb': block_sizes_mb,
-            'file_system': 'tmpfs (/dev/shm)',
-            'implementation': 'Python aiofiles'
-        }
+        'config': config
     }
     
-    # Save results to JSON
-    output_file = f'compare_file_operations_results/block_size_comparison_{total_gb}gb_zeros.json'
-    with open(output_file, 'w') as f:
-        json.dump(all_results, f, indent=2)
+    save_incremental_results(output_file, all_results)
     
     total_time = time.perf_counter() - start_time
     print(f"\n{'='*80}")
@@ -393,24 +540,25 @@ async def block_size_comparison_total(total_gb, iterations, buffer_size):
     
     return all_results
 
-async def block_size_comparison(num_blocks, iterations, buffer_size, cpp=False):
+async def block_size_comparison(num_blocks, iterations, buffer_size, implementation='Python aiofiles'):
     """Benchmark different block sizes across multiple thread counts.
     
     Args:
-        num_blocks: number of blocks to transfer in each test 
+        num_blocks: number of blocks to transfer in each test
         iterations: Number of iterations per test (default: 5)
     """
     start_time = time.perf_counter()
-    if cpp:
-        implementation = 'C++'
+    if implementation=="C++:
         if CPP_AVAILABLE:
             print("Testing C++ implementation...")
         else:
             print("C++ implementation not available.")
             return
-    else:
+    elif implementation=="Python aiofiles":
         print("Testing Python aiofiles implementation...")
-        implementation = 'Python aiofiles'
+    else:
+        print("Invalid implementation specified.")
+        return
 
     # Test parameters
     thread_counts = [16, 32, 64]
@@ -421,9 +569,46 @@ async def block_size_comparison(num_blocks, iterations, buffer_size, cpp=False):
     print(f"Testing {total_combinations} combinations ({len(block_sizes_mb)} block sizes × {len(thread_counts)} threads)")
     print(f"Iterations per test: {iterations}\n")
     
+    # Prepare output file path
+    output_file = f'results/block_size_comparison_{num_blocks}blocks_cpp_{cpp}.json'
+    
+    # Check for existing results
+    existing_results = load_existing_results(output_file)
+    
     # Store results - structure: results[thread_count][block_size] = time
     write_results = {}
     read_results = {}
+    
+    # Configuration for this benchmark
+    config = {
+        'cluster': 'pokprod',
+        'buffer_size': buffer_size,
+        'num_iterations': iterations,
+        'num_blocks': num_blocks,
+        'thread_counts': thread_counts,
+        'block_sizes_mb': block_sizes_mb,
+        'file_system': 'tmpfs (/dev/shm)',
+        'implementation': implementation
+    }
+    
+    # Check if we can resume from existing results
+    completed_write = set()
+    completed_read = set()
+    
+    if existing_results and 'config' in existing_results:
+        if check_config_match(existing_results['config'], config):
+            print(f"Found existing results with matching configuration!")
+            print(f"Resuming benchmark from previous state...\n")
+            write_results = existing_results.get('write', {})
+            read_results = existing_results.get('read', {})
+            completed_write = get_completed_tests(existing_results, 'write')
+            completed_read = get_completed_tests(existing_results, 'read')
+            print(f"Already completed: {len(completed_write)} write tests, {len(completed_read)} read tests")
+        else:
+            print(f"Existing results found but configuration doesn't match.")
+            print(f"Starting fresh benchmark...\n")
+    else:
+        print(f"No existing results found. Starting fresh benchmark...\n")
     
     # Allocate buffer once
     num_elements = buffer_size // 2
@@ -433,16 +618,17 @@ async def block_size_comparison(num_blocks, iterations, buffer_size, cpp=False):
     
     combination_count = 0
     
-    # OUTER LOOP: Block sizes
     for num_threads in thread_counts:
 
-        write_results[str(num_threads)] = {}
-        read_results[str(num_threads)] = {}
+        if str(num_threads) not in write_results:
+            write_results[str(num_threads)] = {}
+        if str(num_threads) not in read_results:
+            read_results[str(num_threads)] = {}
 
         # Set up thread pool executor
-        if cpp:
+        if implementation=="C++":
             benchmark_utils.set_io_thread_count(num_threads)
-        else:
+        elif implementation=="Python aiofiles":
             loop = asyncio.get_running_loop()
             executor = ThreadPoolExecutor(max_workers=num_threads)
             loop.set_default_executor(executor)
@@ -450,7 +636,14 @@ async def block_size_comparison(num_blocks, iterations, buffer_size, cpp=False):
         for block_size_mb in block_sizes_mb:
             block_size = block_size_mb * 1024 * 1024
             combination_count += 1
-            print(f"\n  [{combination_count}/{total_combinations}] block size: {block_size_mb}")
+            
+            # Check if this combination is already completed
+            test_key = (str(num_threads), str(block_size_mb))
+            if test_key in completed_write and test_key in completed_read:
+                print(f"\n  [{combination_count}/{total_combinations}] block size: {block_size_mb}MB, threads: {num_threads} - SKIPPED (already completed)")
+                continue
+            
+            print(f"\n  [{combination_count}/{total_combinations}] block size: {block_size_mb}MB, threads: {num_threads}")
 
             # Generate file names
             file_names = generate_dest_file_names(num_blocks)
@@ -460,17 +653,19 @@ async def block_size_comparison(num_blocks, iterations, buffer_size, cpp=False):
             
             for i in range(iterations):
                 blocks_indices = random.sample(range(buffer_size // block_size), num_blocks)
-                if cpp:
+                if implementation=="C++":
                     # Write benchmark
                     time_write = await cpp_write_blocks(block_size, buffer, blocks_indices, file_names)
                     # Read benchmark
                     time_read = await cpp_read_blocks(block_size, buffer, blocks_indices, file_names)
-                else:
+                elif implementation=="Python aiofiles":
                     # Write benchmark
                     time_write = await aiofiles_write_blocks(block_size, buffer, blocks_indices, file_names)
                     # Read benchmark
                     time_read = await aiofiles_read_blocks(block_size, buffer, blocks_indices, file_names)
-
+                else:
+                    print("invalid implementation")
+                    return
                 times_write.append(time_write)
                 times_read.append(time_read)
             
@@ -481,10 +676,6 @@ async def block_size_comparison(num_blocks, iterations, buffer_size, cpp=False):
                         os.remove(file_name)
                 except Exception as e:
                     print(f"    Warning: Could not remove {file_name}: {e}")
-            
-            # Shutdown executor
-            if not cpp:
-                executor.shutdown(wait=True)
             
             # Calculate average times
             avg_write = statistics.mean(times_write)
@@ -500,26 +691,28 @@ async def block_size_comparison(num_blocks, iterations, buffer_size, cpp=False):
             
             print(f"    Write: {avg_write*1000:.2f}ms ({write_throughput:.2f} GB/s)")
             print(f"    Read:  {avg_read*1000:.2f}ms ({read_throughput:.2f} GB/s)")
-    
-    # Combine results
+            
+            # Save results incrementally after each test
+            current_results = {
+                'write': write_results,
+                'read': read_results,
+                'config': config
+            }
+            save_incremental_results(output_file, current_results)
+            print(f"    Results saved to {output_file}")
+        
+        # Shutdown executor
+        if implementation=="Python aiofiles":
+            executor.shutdown(wait=True)
+            
+    # Final save with complete results
     all_results = {
         'write': write_results,
         'read': read_results,
-        'config': {
-            'buffer_size': buffer_size,
-            'num_iterations': iterations,
-            'num_blocks': num_blocks,
-            'thread_counts': thread_counts,
-            'block_sizes_mb': block_sizes_mb,
-            'file_system': 'tmpfs (/dev/shm)',
-            'implementation': implementation
-        }
+        'config': config
     }
     
-    # Save results to JSON
-    output_file = f'results/block_size_comparison_{num_blocks}blocks_cpp_{cpp}.json'
-    with open(output_file, 'w') as f:
-        json.dump(all_results, f, indent=2)
+    save_incremental_results(output_file, all_results)
     
     total_time = time.perf_counter() - start_time
     print(f"\n{'='*80}")
@@ -538,5 +731,4 @@ if __name__ == "__main__":
     # Run block size comparison with 10GB total data size
     # asyncio.run(aiofiles_block_size_comparison_total(total_gb=10, iterations=3, buffer_size=15*1024*1024*1024))
 
-    asyncio.run(block_size_comparison(num_blocks=1000, iterations=5, buffer_size=70*1024*1024*1024, cpp=True))
-    asyncio.run(block_size_comparison(num_blocks=1000, iterations=5, buffer_size=70*1024*1024*1024, cpp=False))
+    asyncio.run(block_size_comparison(num_blocks=1000, iterations=5, buffer_size=70*1024*1024*1024, implementation="Python aiofiles"))
