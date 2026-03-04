@@ -39,10 +39,9 @@ kubectl exec -n "$NAMESPACE" "$POD_NAME" -- mkdir -p "$DEST_PATH/results"
 # Copy files to pod
 echo "Copying files to pod..."
 kubectl cp compare_file_operations.py "$NAMESPACE/$POD_NAME:$DEST_PATH/"
-kubectl cp nixl_implementation.py "$NAMESPACE/$POD_NAME:$DEST_PATH/"
 kubectl cp setup.py "$NAMESPACE/$POD_NAME:$DEST_PATH/"
 kubectl cp checkpoints_utils.py "$NAMESPACE/$POD_NAME:$DEST_PATH/"
-kubectl cp benchmark_cpp_utils "$NAMESPACE/$POD_NAME:$DEST_PATH/"
+kubectl cp backends "$NAMESPACE/$POD_NAME:$DEST_PATH/"
 
 echo "Files copied to $DEST_PATH in pod $POD_NAME"
 echo ""

@@ -21,10 +21,9 @@ def _get_write_agent():
         _write_agent = None  # Release old agent
         conf = nixl_agent_config(
             enable_prog_thread=True,
-            backends=[]
+            backends=["POSIX"]
         )
         _write_agent = nixl_agent(agent_name="NIXL_Writer", nixl_conf=conf, instantiate_all=False)
-        _write_agent.create_backend("POSIX", initParams={"use_uring": "true"})
     return _write_agent
 
 
@@ -36,11 +35,9 @@ def _get_read_agent():
         _read_agent = None  # Release old agent
         conf = nixl_agent_config(
             enable_prog_thread=True,
-            backends=[]
+            backends=["POSIX"]
         )
         _read_agent = nixl_agent(agent_name="NIXL_Reader", nixl_conf=conf, instantiate_all=False)
-        _read_agent.create_backend("POSIX", initParams={"use_uring": "true"})
-
     return _read_agent
 
 def nixl_register_buffer(agent: nixl_agent, buffer: torch.Tensor):

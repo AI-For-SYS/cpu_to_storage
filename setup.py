@@ -1,5 +1,5 @@
 """
-Setup script for building the benchmark_utils C++ extension.
+Setup script for building the cpp_ext C++ extension.
 
 This script compiles the C++ file I/O utilities into a Python extension module
 that can be imported and used for high-performance parallel file operations.
@@ -16,11 +16,11 @@ import os
 
 # Get the directory containing this setup.py file
 current_dir = os.path.dirname(os.path.abspath(__file__))
-cpp_utils_dir = os.path.join(current_dir, 'benchmark_cpp_utils')
+cpp_utils_dir = os.path.join(current_dir, 'backends', 'benchmark_cpp_utils')
 
 # Source files for the extension
 sources = [
-    os.path.join(cpp_utils_dir, 'benchmark_utils.cpp'),
+    os.path.join(cpp_utils_dir, 'cpp_utils.cpp'),
     os.path.join(cpp_utils_dir, 'file_io.cpp'),
     os.path.join(cpp_utils_dir, 'simple_thread_pool.cpp'),
 ]
@@ -44,7 +44,7 @@ extra_link_args = []
 # Define the extension module
 ext_modules = [
     CppExtension(
-        name='benchmark_utils',
+        name='cpp_ext',
         sources=sources,
         include_dirs=include_dirs,
         extra_compile_args=extra_compile_args['cxx'],
@@ -53,7 +53,7 @@ ext_modules = [
 ]
 
 setup(
-    name='benchmark_utils',
+    name='cpp_ext',
     version='1.0.0',
     author='Your Name',
     description='High-performance parallel file I/O utilities for PyTorch',

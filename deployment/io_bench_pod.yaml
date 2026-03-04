@@ -6,6 +6,15 @@ metadata:
     app: io-benchmark
     owner: rotemshavitt
 spec:
+  affinity:
+    nodeAffinity:
+      requiredDuringSchedulingIgnoredDuringExecution:
+        nodeSelectorTerms:
+        - matchExpressions:
+          - key: kubernetes.io/hostname
+            operator: NotIn
+            values:
+            - pokprod-b93r38s1
   securityContext:
     runAsUser: 0
   containers:

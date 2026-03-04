@@ -1,65 +1,28 @@
 import asyncio
 from typing import Any
 from concurrent.futures import ThreadPoolExecutor
-import aiofiles
-import aiofiles.os  # Required for the atomic replace
 import time
 import os
 import statistics
-from numpy import block
 import torch
 import random
+import argparse
 
-from torch.library import impl
 from checkpoints_utils import save_incremental_results, load_existing_results, check_config_match, get_completed_tests
-from nixl_implementation import nixl_write_blocks, nixl_read_blocks, nixl_register_buffer, nixl_unregister_buffer, _get_read_agent, _get_write_agent
+from backends.nixl_backend import nixl_write_blocks, nixl_read_blocks, nixl_register_buffer, nixl_unregister_buffer, _get_read_agent, _get_write_agent
+from backends.aiofiles_backend import aiofiles_write_blocks, aiofiles_read_blocks
+from backends.python_self_backend import python_self_write_blocks, python_self_read_blocks
+from backends.cpp_backend import cpp_write_blocks, cpp_read_blocks, set_thread_count_cpp, CPP_AVAILABLE
 
 # Storage path configuration - can be overridden by STORAGE_PATH environment variable
 STORAGE_PATH = os.environ.get('STORAGE_PATH', '/dev/shm')
 CLUSTER = os.environ.get('CLUSTER_NAME', 'unknown')
-VERIFY = False
 
-# Import C++ extension for high-performance file I/O
-try:
-    import benchmark_utils
-    CPP_AVAILABLE = True
-except ImportError as e:
-    print(f"Warning: C++ extension not available: {e}")
-    print("Run 'python setup.py build_ext --inplace' in compare_file_operations/ to build it")
-    CPP_AVAILABLE = False
 
 def generate_dest_file_names(num_files):
     return [f"{STORAGE_PATH}/final_{j}.bin" for j in range(num_files)]
 
 def verify_file(original_data, filename):
-    """Verifies that the file on disk matches the original CPU buffer."""
-    if not os.path.exists(filename):
-        return False
-    
-    with open(filename, "rb") as f:
-        file_data = f.read()
-    
-    return file_data == original_data
-
-def verify_read(block_size, block_indices, view, dest_files):                    
-    if VERIFY:
-        for i,block_inx in enumerate(block_indices):
-            if not verify_file(view[block_inx*block_size: (block_inx+1)*block_size], dest_files[i]):
-                print(f"Reading block {block_inx} Failed")
-                return
-        print("Verified reading blocks")
-
-def verify_write(block_size, block_indices, view, dest_files):                    
-    if VERIFY:
-        for i,block_inx in enumerate(block_indices):
-            if not verify_file(view[block_inx*block_size: (block_inx+1)*block_size], dest_files[i]):
-                print(f"Writing block {block_inx} Failed")
-                return
-        print("Verified writing blocks")
-
-
-def verify_file_cpp(original_data, filename):
-    """Verifies that the file on disk matches the original CPU buffer."""
     if not os.path.exists(filename):
         print(f"File {filename} does not exist")
         return False
@@ -67,322 +30,28 @@ def verify_file_cpp(original_data, filename):
     with open(filename, "rb") as f:
         file_data = f.read()
     
-    # Convert tensor to bytes for comparison
-    original_bytes = original_data.numpy().tobytes()
+    # Convert memoryview to bytes
+    original_bytes = bytes(original_data)
     
+    # Check size first for better error messages
     if len(file_data) != len(original_bytes):
-        print(f"Size mismatch: file has {len(file_data)} bytes, expected {len(original_bytes)} bytes")
+        print(f"Size mismatch in {filename}: file has {len(file_data)} bytes, expected {len(original_bytes)} bytes")
         return False
-
+    
     return file_data == original_bytes
 
-def read_block_from_file_sync(block_size, block_inx, buffer_view, file_name):
-    """Synchronously read a single block from file into buffer_view."""
-    try:
-        start = block_inx * block_size
-        mv_slice = buffer_view[start : start + block_size]
-
-        with open(file_name, "rb") as f:
-            # read directly into the memoryview slice
-            bytes_read = f.readinto(mv_slice)
-            if bytes_read != block_size:
-                print(f"read {bytes_read} instead of {block_size} from {file_name}")
-                return False
-        return True
-    except Exception as e:
-        print(f"Error reading {file_name}: {e}")
-        return False
-
-async def write_and_rename(block_size, block_inx, buffer_view, temp_name, final_name):
-    """Encapsulates the logic for a single buffer operation."""
-    try:
-        # Step A: Write to temporary file
-        async with aiofiles.open(temp_name, "wb") as f:
-            await f.write(buffer_view[block_inx*block_size: (block_inx+1)*block_size])
-
-        # Step B: Atomically rename
-        await aiofiles.os.replace(temp_name, final_name)
-        return True
-    except Exception as e:
-        print(f"Error processing {final_name}: {e}")
-        if await aiofiles.os.path.exists(temp_name):
-            await aiofiles.os.unlink(temp_name)
-        return False
-
-async def read_block_from_file(block_size, block_inx, buffer_view, file_name):
-    """Encapsulates the logic for reading a single block from file."""
-    try:
-        # Step A: Read from file
-        async with aiofiles.open(file_name, "rb") as f:
-            bytes_read = await f.readinto(buffer_view[block_inx*block_size : (block_inx+1)*block_size])
-            if bytes_read != block_size:
-                print(f"read {bytes_read} instead of {block_size}")
-        return True
-    except Exception as e:
-        print(f"Error reading {file_name}: {e}")
-        return False
-
-async def aiofiles_write_blocks(block_size, buffer_view, block_indices, dest_files):
-    tasks: list[Any] = []
-
-    start = time.perf_counter()
-    for i,block_inx in enumerate(block_indices):
-        tasks.append(write_and_rename(block_size, block_inx, buffer_view, f"{STORAGE_PATH}/temp_block_{block_inx}.bin", dest_files[i]))
+def verify_op(block_size, block_indices, view, dest_files, operation="operation", verify=False):
+    if not verify:
+        return
     
-    results = await asyncio.gather(*tasks)
-    end: float = time.perf_counter()
-    return (end -start)
-
-
-# V3: Optimized with temp file + rename pattern
-def write_block_direct(block_size, block_inx, buffer_view, temp_name, final_name):
-    """Optimized write with temp file + atomic rename.
-    
-    Key optimizations:
-    - Temp file + atomic rename for safety
-    - No fsync for better performance
-    - Single open/write/close sequence
-    - Minimal system calls
-    """
-    try:
-        start = block_inx * block_size
-        end = start + block_size
-        
-        # Write to temp file
-        fd = os.open(temp_name, os.O_CREAT | os.O_WRONLY | os.O_TRUNC, 0o644)
-        try:
-            bytes_written = os.write(fd, buffer_view[start:end])
-            if bytes_written != block_size:
-                return False
-        finally:
-            os.close(fd)
-        
-        # Atomically rename temp to final
-        os.replace(temp_name, final_name)
-        return True
-    except:
-        # Clean up temp file on error
-        try:
-            if os.path.exists(temp_name):
-                os.remove(temp_name)
-        except:
-            pass
-        return False
-
-
-async def python_write_blocks(block_size, buffer_view, block_indices, dest_files, num_threads=None):
-    """V3: Optimized version with temp file + rename using default executor."""
-    loop = asyncio.get_running_loop()
-    
-    start = time.perf_counter()
-   
-    tasks = [
-        loop.run_in_executor(
-            None,  # Use default executor
-            write_block_direct,
-            block_size, block_inx, buffer_view,
-            f"{STORAGE_PATH}/temp_block_{block_inx}.bin",
-            dest_files[i],
-        )
-        for i, block_inx in enumerate(block_indices)
-    ]
-
-    results = await asyncio.gather(*tasks)
-    end: float = time.perf_counter()
-    
-    return (end -start)
-
-async def python_read_blocks(block_size, buffer_view, block_indices, dest_files, num_threads=None):
-    """V3: Ultra-optimized version with direct reads using default executor."""
-    loop = asyncio.get_running_loop()
-    
-    start = time.perf_counter()
-
-    tasks = [
-        loop.run_in_executor(
-            None,  # Use default executor
-            read_block_from_file_sync,
-            block_size, block_inx, buffer_view,
-            dest_files[i],
-        )
-        for i, block_inx in enumerate(block_indices)
-    ]
-    
-    results = await asyncio.gather(*tasks)
-    end: float = time.perf_counter()
-    
-    return (end -start)
-
-async def aiofiles_read_blocks(block_size, buffer_view, block_indices, dest_files):
-    tasks: list[Any] = []
-
-    start = time.perf_counter()
-    for i,block_inx in enumerate(block_indices):
-        tasks.append(read_block_from_file(block_size, block_inx, buffer_view, dest_files[i]))
-    
-    results = await asyncio.gather(*tasks)
-    end: float = time.perf_counter()
-    for result in results:
-        if not result:
-            print(f"Reading blocks with aiofiles Failed")
+    for i, block_inx in enumerate(block_indices):
+        start_byte = block_inx * block_size
+        end_byte = (block_inx + 1) * block_size
+        if not verify_file(view[start_byte:end_byte], dest_files[i]):
+            print(f"{operation} block {block_inx} Failed")
             return
-    return (end -start)
     
-# --------- or implementation ------------
-def read_block_direct_or(fd, buffer_view_slice):
-    try:
-        bytes_read = os.readv(fd,buffer_view_slice)
-        return bytes_read == len(buffer_view_slice)
-    except:
-        raise
-        return False
-
-async def python_read_blocks_or(block_size, buffer, block_indices, dest_files):
-    view = memoryview(buffer.numpy()).cast('B')
-    loop = asyncio.get_running_loop()
-
-    start = time.perf_counter()
-
-    # Pre-open all files
-    fds: list[int] = [os.open(fn, os.O_RDONLY) for fn in dest_files]
-
-    tasks = [
-        loop.run_in_executor(
-            None,  # Use default executor
-            read_block_direct_or,
-            fd, [view[start:start + block_size]]
-        )
-        for fd, start in zip(fds, (block_inx * block_size for block_inx in block_indices))
-    ]
-
-    results = await asyncio.gather(*tasks)
-    # Close fds
-    for fd in fds:
-        os.close(fd)
-    end: float = time.perf_counter()
-    return (end-start)
-
-def write_block_direct_or(temp_name, dest_name, buffer_view_slice):
-    try:
-        fd=os.open(temp_name, os.O_CREAT | os.O_WRONLY | os.O_TRUNC)
-        bytes_written = os.write(fd, buffer_view_slice)
-        os.close(fd)
-        os.replace(temp_name, dest_name)
-        return bytes_written == len(buffer_view_slice)
-    except:
-        return False
-
-async def python_write_blocks_or(block_size, buffer, block_indices, dest_files):
-    tasks: list[Any] = []
-    view: memoryview[int] = memoryview(buffer.numpy()).cast('B')
-    
-    loop = asyncio.get_running_loop()
-    start = time.perf_counter()
-
-    temp_names = [f"{STORAGE_PATH}/temp_block_{i}.bin" for i in block_indices]
-
-    tasks = [
-        loop.run_in_executor(
-            None,
-            write_block_direct_or,
-            temp_name, dest_file, view[start:start+block_size]
-        )
-        for temp_name, dest_file, start in zip(temp_names, dest_files, (i * block_size for i in block_indices))
-    ]
-
-    results = await asyncio.gather(*tasks)
-    end = time.perf_counter()
-    return (end - start)
-
-def write_block_direct_best(temp_name, fd, dest_name, buffer_view_slice):
-    try:
-        bytes_written = os.write(fd, buffer_view_slice)
-        os.close(fd)
-        os.replace(temp_name, dest_name)
-        return bytes_written == len(buffer_view_slice)
-    except:
-        return False
-
-async def  python_write_blocks_best(block_size, buffer, block_indices, dest_files):
-    tasks: list[Any] = []
-    view: memoryview[int] = memoryview(buffer.numpy()).cast('B')
-    
-    loop = asyncio.get_running_loop()
-    start = time.perf_counter()
-
-    temp_names = [f"{STORAGE_PATH}/temp_block_{i}.bin" for i in block_indices]
-    fds = [os.open(temp_name,  os.O_CREAT | os.O_WRONLY | os.O_TRUNC) for temp_name in temp_names]
-
-    tasks = [
-        loop.run_in_executor(
-            None,
-            write_block_direct_best,
-            temp_name, fd, dest_file, view[start:start+block_size]
-        )
-        for temp_name, fd, dest_file, start in zip(temp_names, fds, dest_files, (i * block_size for i in block_indices))
-    ]
-
-    results = await asyncio.gather(*tasks)
-    end = time.perf_counter()
-    return (end - start)
-
-
-async def cpp_write_blocks(block_size, buffer, block_indices, dest_files):
-    """C++ implementation wrapper for writing blocks.
-    
-    The C++ function handles threading internally and releases the GIL,
-    so we call it directly. It returns execution time in seconds.
-    """
-    start = time.perf_counter()
-    
-    # C++ function releases GIL and uses its own thread pool
-    success = benchmark_utils.cpp_write_blocks(
-        buffer, block_size, block_indices, dest_files
-    )
-    end = time.perf_counter()
-
-    if not success:
-        print("Writing blocks with c++ Failed")
-        return
-
-    if VERIFY:
-        bytes_per_element = buffer.element_size()  # 2 for float16
-        elements_per_block = block_size // bytes_per_element
-
-        for i, block_inx in enumerate(block_indices):
-            start_elem = block_inx * elements_per_block
-            end_elem = (block_inx + 1) * elements_per_block
-            if not verify_file_cpp(buffer[start_elem:end_elem], dest_files[i]):
-                print(f"writing block {block_inx} with c++ Failed")
-    return (end-start)
-
-async def cpp_read_blocks(block_size, buffer, block_indices, dest_files):
-    """C++ implementation wrapper for reading blocks.
-    
-    The C++ function handles threading internally and releases the GIL,
-    so we call it directly. It returns execution time in seconds.
-    """
-    start = time.perf_counter()
-    # C++ function releases GIL and uses its own thread pool
-    success = benchmark_utils.cpp_read_blocks(
-        buffer, block_size, block_indices, dest_files
-    )
-    if not success:
-        print("Reading blocks with c++ Failed")
-        return
-    end = time.perf_counter()
-
-    if VERIFY:
-        bytes_per_element = buffer.element_size()  # 2 for float16
-        elements_per_block = block_size // bytes_per_element
-
-        for i, block_inx in enumerate(block_indices):
-            start_elem = block_inx * elements_per_block
-            end_elem = (block_inx + 1) * elements_per_block
-            if not verify_file_cpp(buffer[start_elem:end_elem], dest_files[i]):
-                print(f"writing block {block_inx} with c++ Failed")
-                exit()
-    return (end-start)
+    print(f"Verified {operation} blocks")
 
 def clean_files(file_names):
     for file_name in file_names:
@@ -392,40 +61,40 @@ def clean_files(file_names):
         except Exception as e:
             print(f"    Warning: Could not remove {file_name}: {e}")
 
-async def block_size_comparison(num_blocks, iterations, buffer_size, implementation, file_name):
+async def blocks_benchmark(num_blocks, iterations, buffer_size, implementation, test_name, block_sizes_mb, threads_counts, verify=False):
     """Benchmark different block sizes across multiple thread counts.
     
     Args:
         num_blocks: number of blocks to transfer in each test
         iterations: Number of iterations per test (default: 5)
+        buffer_size: Size of buffer in bytes
+        implementation: Implementation to test
+        test_name: Output file name prefix
+        threads_counts: List of thread counts to test (default: [16, 32, 64])
+        block_sizes_mb: List of block sizes in MB to test (default: [2, 4, 8, 16, 32])
+        verify: Whether to verify file contents after operations (default: False)
     """
     start_time = time.perf_counter()
-    print(f"Testing {implementation} implementation...")
-    python_implementations = ["python_aiofiles", "python_self_implementation", "nixl", "python_or", "python_best"]
-    if implementation=="C++":
+
+    python_backends = ["python_aiofiles", "python_self_implementation", "nixl"]
+    if implementation=="cpp":
         if not CPP_AVAILABLE:
-            print("C++ implementation not available.")
+            print("cpp implementation not available.")
             return
-    elif implementation not in python_implementations:
+    elif implementation not in python_backends:
         print("Invalid implementation specified.")
         return
-
-    # Test parameters
-    thread_counts = [16,32,64]
-    block_sizes_mb: list[int] = [2, 4, 8, 16, 32]
-    # block_sizes_mb: list[int] = list(range(4,68,4))
-    # block_sizes_mb.insert(0,2)
-    diff = block_sizes_mb[-1]*num_blocks* - buffer_size/(1024*1024)
+    
+    diff = block_sizes_mb[-1]*num_blocks - buffer_size/(1024*1024)
     if diff>0:
         print(f"Buffer is not large enugh, missing {diff} mb")
         return
 
     # Calculate total combinations
-    total_combinations = len(block_sizes_mb) * len(thread_counts)
-    print(f"Testing {total_combinations} combinations ({len(block_sizes_mb)} block sizes × {len(thread_counts)} threads)")
-    print(f"Iterations per test: {iterations}\n")
+    total_combinations = len(block_sizes_mb) * len(threads_counts)
+    print(f"Testing {total_combinations} combinations ({len(block_sizes_mb)} block sizes × {len(threads_counts)} threads)")
     
-    output_file = f'results/{file_name}_{implementation}.json'
+    output_file = f'results/blocks_{test_name}_{implementation}_{num_blocks}blocks.json'
     existing_results: dict[Any, Any] | None = load_existing_results(output_file)
     
     # Store results - structure: results[thread_count][block_size] = time
@@ -438,7 +107,7 @@ async def block_size_comparison(num_blocks, iterations, buffer_size, implementat
         'buffer_size': buffer_size,
         'num_iterations': iterations,
         'num_blocks': num_blocks,
-        'thread_counts': thread_counts,
+        'thread_counts': threads_counts,
         'block_sizes_mb': block_sizes_mb,
         'file_system': f'{STORAGE_PATH} ({"tmpfs" if STORAGE_PATH == "/dev/shm" else "persistent storage"})',
         'implementation': implementation
@@ -474,7 +143,7 @@ async def block_size_comparison(num_blocks, iterations, buffer_size, implementat
 
     combination_count = 0
     
-    for num_threads in thread_counts:
+    for num_threads in threads_counts:
 
         if str(num_threads) not in write_results:
             write_results[str(num_threads)] = {}
@@ -482,8 +151,8 @@ async def block_size_comparison(num_blocks, iterations, buffer_size, implementat
             read_results[str(num_threads)] = {}
 
         # Set up thread pool executor
-        if implementation=="C++":
-            benchmark_utils.set_io_thread_count(num_threads)    
+        if implementation=="cpp":
+            set_thread_count_cpp(num_threads)
         else:
             loop = asyncio.get_running_loop()
             executor = ThreadPoolExecutor(max_workers=num_threads)
@@ -510,39 +179,35 @@ async def block_size_comparison(num_blocks, iterations, buffer_size, implementat
                 blocks_indices_write = random.sample(range(buffer_size // block_size), num_blocks)
                 blocks_indices_read = random.sample(range(buffer_size // block_size), num_blocks)
 
-                if implementation=="C++":
-                    time_write = await cpp_write_blocks(block_size, buffer, blocks_indices_write, file_names)
-                    time_read = await cpp_read_blocks(block_size, buffer, blocks_indices_read, file_names)
-                
+                if implementation=="cpp":
+                    time_write = await cpp_write_blocks(block_size, buffer, blocks_indices_write, file_names, view)
+                    verify_op(block_size, blocks_indices_write, view, file_names, "Writing", verify)
+
+                    time_read = await cpp_read_blocks(block_size, buffer, blocks_indices_read, file_names, view)
+
                 elif implementation=="python_aiofiles":
                     time_write = await aiofiles_write_blocks(block_size, view, blocks_indices_write, file_names)
-                    time_read = await aiofiles_read_blocks(block_size, view, blocks_indices_read, file_names)
+                    verify_op(block_size, blocks_indices_write, view, file_names, "Writing", verify)
 
-                elif implementation=="python_self_implementation":
-                    time_write = await python_write_blocks(block_size, view, blocks_indices_write, file_names, num_threads)
-                    time_read = await python_read_blocks(block_size, view, blocks_indices_read, file_names, num_threads)
+                    time_read = await aiofiles_read_blocks(block_size, view, blocks_indices_read, file_names)
 
                 elif implementation=="nixl":
                     reg_handler_write = nixl_register_buffer(_get_write_agent(), buffer)
                     time_write = nixl_write_blocks(block_size, buffer, blocks_indices_write, file_names)
+                    verify_op(block_size, blocks_indices_write, view, file_names, "Writing", verify)
                     nixl_unregister_buffer(_get_write_agent(), reg_handler_write)
+
                     reg_handler_read = nixl_register_buffer(_get_read_agent(), buffer)
                     time_read = nixl_read_blocks(block_size, buffer, blocks_indices_read, file_names)
                     nixl_unregister_buffer(_get_read_agent(), reg_handler_read)
-                
-                elif implementation=="python_or":
-                    time_write = await python_write_blocks_or(block_size, buffer, blocks_indices_write, file_names)
-                    time_read = await python_read_blocks_or(block_size, buffer, blocks_indices_read, file_names, num_threads)
-                
-                elif implementation=="python_best":
-                    time_write = await python_write_blocks_best(block_size, buffer, blocks_indices_write, file_names)
-                    time_read = await python_read_blocks_or(block_size, buffer, blocks_indices_read, file_names, num_threads)
+                           
                 else:
-                    print("invalid implementation")
-                    return
-                if implementation!="C++":
-                    verify_write(block_size, blocks_indices_write, view, file_names)
-                    verify_read(block_size, blocks_indices_read, view, dest_files=file_names)
+                    time_write = await python_self_write_blocks(block_size, view, blocks_indices_write, file_names)
+                    verify_op(block_size, blocks_indices_write, view, file_names, "Writing", verify)
+
+                    time_read = await python_self_read_blocks(block_size, view, blocks_indices_read, file_names)
+       
+                verify_op(block_size, blocks_indices_read, view, file_names, "Reading", verify)
 
                 times_write.append(time_write)
                 times_read.append(time_read)
@@ -561,9 +226,9 @@ async def block_size_comparison(num_blocks, iterations, buffer_size, implementat
             
             # Save results incrementally after each test
             current_results = {
+                'config': config,
                 'write': write_results,
-                'read': read_results,
-                'config': config
+                'read': read_results
             }
             save_incremental_results(output_file, current_results)
             print(f"    Results saved to {output_file}")
@@ -574,9 +239,9 @@ async def block_size_comparison(num_blocks, iterations, buffer_size, implementat
             
     # Final save with complete results
     all_results = {
+        'config': config,
         'write': write_results,
-        'read': read_results,
-        'config': config
+        'read': read_results
     }
     
     save_incremental_results(output_file, all_results)
@@ -590,37 +255,32 @@ async def block_size_comparison(num_blocks, iterations, buffer_size, implementat
     return all_results
 
 
-async def block_size_comparison_total(total_gb, iterations, buffer_size, implementation):
+async def total_data_benchmark(total_gb, iterations, buffer_size, implementation, test_name, block_sizes_mb, threads_counts, verify=False):
     """Benchmark different block sizes across multiple thread counts.
     
     Args:
-        total_mb: Total data size in MB to transfer for each test (default: 2048 MB = 2 GB)
-        iterations: Number of iterations per test (default: 5)
+        total_gb: Total data size in GB to transfer for each test
+        iterations: Number of iterations per test
+        buffer_size: Size of buffer in bytes
+        implementation: Implementation to test
+        test_name: Output file name prefix
+        thread_counts: List of thread counts to test (default: [16, 32, 64])
+        block_sizes_mb: List of block sizes in MB to test (default: [2, 4, 8, 16, 32, 64])
+        verify: Whether to verify file contents after operations (default: False)
     """
     start_time = time.perf_counter()
 
-    print(f"Testing {implementation} implementation...")
-    python_implementations = ["python_aiofiles", "nixl", "python_best"]
-    if implementation=="C++":
+    if implementation=="cpp":
         if not CPP_AVAILABLE:
-            print("C++ implementation not available.")
+            print("cpp implementation not available.")
             return
-    elif implementation not in python_implementations:
-        print("Invalid implementation specified.")
-        return
-
-
-    # Test parameters
-    thread_counts = [16, 32, 64]
-    block_sizes_mb = [2, 4, 8, 16, 32, 64]
 
     # Calculate total combinations
-    total_combinations = len(block_sizes_mb) * len(thread_counts)
-    print(f"Testing {total_combinations} combinations ({len(block_sizes_mb)} block sizes × {len(thread_counts)} threads)")
+    total_combinations = len(block_sizes_mb) * len(threads_counts)
+    print(f"Testing {total_combinations} combinations ({len(block_sizes_mb)} block sizes × {len(threads_counts)} threads)")
     print(f"Fixed total data size per test: {total_gb} GB)")
-    print(f"Iterations per test: {iterations}\n")
     
-    output_file = f'results/total_{total_gb}gb_memory_{implementation}.json'
+    output_file = f'results/data_{test_name}_{total_gb}gb_memory_{implementation}.json'
     existing_results = load_existing_results(output_file)
     
     # Store results - structure: results[block_size][thread_count] = time
@@ -633,7 +293,7 @@ async def block_size_comparison_total(total_gb, iterations, buffer_size, impleme
         'buffer_size': buffer_size,
         'num_iterations': iterations,
         'total_data_size_gb': total_gb,
-        'thread_counts': thread_counts,
+        'threads_counts': threads_counts,
         'block_sizes_mb': block_sizes_mb,
         'file_system': f'{STORAGE_PATH} ({"tmpfs" if STORAGE_PATH == "/dev/shm" else "persistent storage"})',
         'implementation': implementation
@@ -667,7 +327,7 @@ async def block_size_comparison_total(total_gb, iterations, buffer_size, impleme
 
     combination_count = 0
     
-    for num_threads in thread_counts:
+    for num_threads in threads_counts:
                 
         if str(num_threads) not in write_results:
             write_results[str(num_threads)] = {}
@@ -675,8 +335,8 @@ async def block_size_comparison_total(total_gb, iterations, buffer_size, impleme
             read_results[str(num_threads)] = {}
         
                 # Set up thread pool executor
-        if implementation=="C++":
-            benchmark_utils.set_io_thread_count(num_threads)    
+        if implementation=="cpp":
+            set_thread_count_cpp(num_threads)
         else:
             loop = asyncio.get_running_loop()
             executor = ThreadPoolExecutor(max_workers=num_threads)
@@ -706,27 +366,37 @@ async def block_size_comparison_total(total_gb, iterations, buffer_size, impleme
             times_read = []
             
             for i in range(iterations):
-                print(f"iteration {i+1}")
                 blocks_indices_write = random.sample(range(buffer_size // block_size), num_blocks_to_copy)
                 blocks_indices_read = random.sample(range(buffer_size // block_size), num_blocks_to_copy)
                 
-                if implementation=="C++":
-                    time_write = await cpp_write_blocks(block_size, buffer, blocks_indices_write, file_names)
-                    time_read = await cpp_read_blocks(block_size, buffer, blocks_indices_read, file_names)
+                if implementation=="cpp":
+                    time_write = await cpp_write_blocks(block_size, buffer, blocks_indices_write, file_names, view)
+                    verify_op(block_size, blocks_indices_write, view, file_names, "Writing", verify)
+
+                    time_read = await cpp_read_blocks(block_size, buffer, blocks_indices_read, file_names, view)
                 
                 elif implementation=="python_aiofiles":
                     time_write = await aiofiles_write_blocks(block_size, view, blocks_indices_write, file_names)
+                    verify_op(block_size, blocks_indices_write, view, file_names, "Writing", verify)
+
                     time_read = await aiofiles_read_blocks(block_size, view, blocks_indices_read, file_names)
                 
-                elif implementation=="python_best":
-                    time_write = await python_write_blocks_best(block_size, buffer, blocks_indices_write, file_names)
-                    time_read = await python_read_blocks_or(block_size, buffer, blocks_indices_read, file_names)
+                elif implementation=="nixl":
+                    reg_handler_write = nixl_register_buffer(_get_write_agent(), buffer)
+                    time_write = nixl_write_blocks(block_size, buffer, blocks_indices_write, file_names)
+                    verify_op(block_size, blocks_indices_write, view, file_names, "Writing", verify)
+                    nixl_unregister_buffer(_get_write_agent(), reg_handler_write)
+
+                    reg_handler_read = nixl_register_buffer(_get_read_agent(), buffer)
+                    time_read = nixl_read_blocks(block_size, buffer, blocks_indices_read, file_names)
+                    nixl_unregister_buffer(_get_read_agent(), reg_handler_read)
                 else:
-                    print("invalid implementation")
-                    return
-                if implementation!="C++":
-                    verify_write(block_size, blocks_indices_write, view, file_names)
-                    verify_read(block_size, blocks_indices_read, view, dest_files=file_names)
+                    time_write = await python_self_write_blocks(block_size, view, blocks_indices_write, file_names)
+                    verify_op(block_size, blocks_indices_write, view, file_names, "Writing", verify)
+
+                    time_read = await python_self_read_blocks(block_size, view, blocks_indices_read, file_names)
+         
+                verify_op(block_size, blocks_indices_read, view, file_names, "Reading", verify)
                 
                 times_write.append(time_write)
                 times_read.append(time_read)
@@ -747,9 +417,9 @@ async def block_size_comparison_total(total_gb, iterations, buffer_size, impleme
             
             # Save results incrementally after each test
             current_results = {
+                'config': config,
                 'write': write_results,
-                'read': read_results,
-                'config': config
+                'read': read_results
             }
             save_incremental_results(output_file, current_results)
             print(f"    Results saved to {output_file}")
@@ -759,9 +429,9 @@ async def block_size_comparison_total(total_gb, iterations, buffer_size, impleme
     
     # Final save with complete results
     all_results = {
+        'config': config,
         'write': write_results,
-        'read': read_results,
-        'config': config
+        'read': read_results
     }
     
     save_incremental_results(output_file, all_results)
@@ -776,17 +446,117 @@ async def block_size_comparison_total(total_gb, iterations, buffer_size, impleme
 
 
 if __name__ == "__main__":
-    # Run benchmark
-    buffer_size = 100*1024*1024*1024
-    num_blocks = 10000
-    file_name = "storage_10000"
-
-    # asyncio.run(block_size_comparison(num_blocks, 5, buffer_size, implementation="C++", file_name=file_name))
-    # asyncio.run(block_size_comparison(num_blocks, 5, buffer_size, implementation="python_aiofiles", file_name))
-    # asyncio.run(block_size_comparison(num_blocks, 5, buffer_size, implementation="nixl"))
-    # asyncio.run(block_size_comparison(num_blocks, 5, buffer_size, implementation="python_best", file_name=file_name))
-    # asyncio.run(block_size_comparison(num_blocks, 5, buffer_size=buffer_size, implementation="nixl"))
-
     
-    asyncio.run(block_size_comparison_total(100, 5, buffer_size, implementation="C++"))
-    asyncio.run(block_size_comparison_total(100, 5, buffer_size, implementation="python_best"))
+    parser = argparse.ArgumentParser(
+        description='Run I/O benchmark with configurable parameters',
+        formatter_class=argparse.RawDescriptionHelpFormatter
+    )
+    
+    parser.add_argument(
+        '--mode',
+        type=str,
+        choices=['blocks', 'data'],
+        default='blocks',
+        help='Benchmark mode: "blocks" for fixed number of blocks, "data" for fixed total data size (default: blocks)'
+    )
+    parser.add_argument(
+        '--backend',
+        type=str,
+        choices=['cpp', 'python_aiofiles', 'python_self_implementation', 'nixl'],
+        default='python_self_implementation',
+        help='I/O backend to benchmark (default: python_self_implementation)'
+    )
+    parser.add_argument(
+        '--buffer-size',
+        type=int,
+        default=100,
+        help='Buffer size in GB (default: 100)'
+    )
+    parser.add_argument(
+        '--iterations',
+        type=int,
+        default=5,
+        help='Number of iterations per test (default: 5)'
+    )
+    parser.add_argument(
+        '--num-blocks',
+        type=int,
+        default=1000,
+        help='Number of blocks to transfer (for blocks mode, default: 1000)'
+    )
+    parser.add_argument(
+        '--test-name',
+        type=str,
+        default="",
+        help='Output file name prefix'
+    )
+    parser.add_argument(
+        '--total-gb',
+        type=int,
+        default=100,
+        help='Total data size in GB (for total mode, default: 100)'
+    )
+    parser.add_argument(
+        '--block-sizes',
+        type=int,
+        nargs='+',
+        default=[2, 4, 8, 16, 32, 64],
+        help='List of block sizes in MB to test. Example: --block-sizes 2 4 8 16'
+    )
+    parser.add_argument(
+        '--verify',
+        action='store_true',
+        default=False,
+        help='Verify file contents after write/read operations (default: False)'
+    )
+    
+    args = parser.parse_args()
+    
+    # Convert buffer size from GB to bytes
+    buffer_size = args.buffer_size * 1024 * 1024 * 1024
+    threads_counts = [16, 32, 64]
+    
+    print("="*80)
+    print("I/O BENCHMARK CONFIGURATION")
+    print("="*80)
+    print(f"Mode:            {args.mode}")
+    print(f"Backend:         {args.backend}")
+    print(f"Buffer Size:     {args.buffer_size} GB")
+    print(f"Iterations:      {args.iterations}")
+    print(f"Block Sizes:     {args.block_sizes} MB")
+    print(f"Storage Path:    {STORAGE_PATH}")
+    print(f"Cluster:         {CLUSTER}")
+    print(f"Test_name:       {args.test_name}")
+    print(f"Verify:          {args.verify}")
+
+    if args.mode == 'blocks':
+        print(f"Num Blocks:      {args.num_blocks}")
+        print("="*80)
+        print()
+        
+        asyncio.run(blocks_benchmark(
+            num_blocks=args.num_blocks,
+            iterations=args.iterations,
+            buffer_size=buffer_size,
+            implementation=args.backend,
+            test_name=args.test_name,
+            block_sizes_mb=args.block_sizes,
+            threads_counts=threads_counts,
+            verify=args.verify
+        ))
+    
+    elif args.mode == 'data':
+        print(f"Total Data:      {args.total_gb} GB")
+        print("="*80)
+        print()
+        
+        asyncio.run(total_data_benchmark(
+            total_gb=args.total_gb,
+            iterations=args.iterations,
+            buffer_size=buffer_size,
+            implementation=args.backend,
+            test_name=args.test_name,
+            block_sizes_mb=args.block_sizes,
+            threads_counts=threads_counts,
+            verify=args.verify
+        ))

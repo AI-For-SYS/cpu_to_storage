@@ -51,7 +51,7 @@ static SimpleThreadPool& get_thread_pool() {
 
 // Set the number of threads for the thread pool
 // Note: This will recreate the thread pool, so call before any I/O operations
-void set_io_thread_count(size_t num_threads) {
+void set_thread_count(size_t num_threads) {
   if (num_threads == 0) {
     throw std::runtime_error("Thread count must be greater than 0");
   }
@@ -238,8 +238,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         py::arg("block_indices"),
         py::arg("source_files"));
 
-  m.def("set_io_thread_count",
-        &set_io_thread_count,
+  m.def("set_thread_count",
+        &set_thread_count,
         "Set the number of threads for the I/O thread pool",
         py::arg("num_threads"));
 

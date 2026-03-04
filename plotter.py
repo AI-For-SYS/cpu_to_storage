@@ -1,6 +1,5 @@
 import json
 import matplotlib.pyplot as plt
-from torch.fx import config
 
 
 def plot_results_threads_comparison(results_file='compare_file_operations/results/threads_comp_bs32_readinto.json'):
@@ -29,18 +28,18 @@ def plot_results_threads_comparison(results_file='compare_file_operations/result
     subtitle += f"Block Size: {block_size_mb:.0f} MB | Blocks Copied: {num_blocks}"
     
     # Extract thread counts and metrics
-    thread_counts = sorted([int(k) for k in write_data.keys()])
+    threads_counts = sorted([int(k) for k in write_data.keys()])
     
     # Prepare time data for plotting
-    write_avg_time = [write_data[str(tc)]['avg'] for tc in thread_counts]
-    write_median_time = [write_data[str(tc)]['median'] for tc in thread_counts]
-    write_min_time = [write_data[str(tc)]['min'] for tc in thread_counts]
-    write_max_time = [write_data[str(tc)]['max'] for tc in thread_counts]
+    write_avg_time = [write_data[str(tc)]['avg'] for tc in threads_counts]
+    write_median_time = [write_data[str(tc)]['median'] for tc in threads_counts]
+    write_min_time = [write_data[str(tc)]['min'] for tc in threads_counts]
+    write_max_time = [write_data[str(tc)]['max'] for tc in threads_counts]
     
-    read_avg_time = [read_data[str(tc)]['avg'] for tc in thread_counts]
-    read_median_time = [read_data[str(tc)]['median'] for tc in thread_counts]
-    read_min_time = [read_data[str(tc)]['min'] for tc in thread_counts]
-    read_max_time = [read_data[str(tc)]['max'] for tc in thread_counts]
+    read_avg_time = [read_data[str(tc)]['avg'] for tc in threads_counts]
+    read_median_time = [read_data[str(tc)]['median'] for tc in threads_counts]
+    read_min_time = [read_data[str(tc)]['min'] for tc in threads_counts]
+    read_max_time = [read_data[str(tc)]['max'] for tc in threads_counts]
     
     # Convert time (ms) to throughput (GB/s)
     # Throughput = data_size_gb / (time_ms / 1000)
@@ -58,9 +57,9 @@ def plot_results_threads_comparison(results_file='compare_file_operations/result
     fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(16, 6))
     
     # Plot Write Results
-    ax1.plot(thread_counts, write_avg, 'o-', label='Average', linewidth=2, markersize=8)
-    ax1.plot(thread_counts, write_median, 's-', label='Median', linewidth=2, markersize=8)
-    ax1.fill_between(thread_counts, write_min, write_max, alpha=0.2, label='Min-Max Range')
+    ax1.plot(threads_counts, write_avg, 'o-', label='Average', linewidth=2, markersize=8)
+    ax1.plot(threads_counts, write_median, 's-', label='Median', linewidth=2, markersize=8)
+    ax1.fill_between(threads_counts, write_min, write_max, alpha=0.2, label='Min-Max Range')
     ax1.set_xlabel('Number of Threads', fontsize=12)
     ax1.set_ylabel('Throughput (GB/s)', fontsize=12)
     ax1.set_title('Write Throughput vs Thread Count', fontsize=14, fontweight='bold')
@@ -69,13 +68,13 @@ def plot_results_threads_comparison(results_file='compare_file_operations/result
              fontsize=9, ha='center', va='top', style='italic', color='#555555')
     ax1.grid(True, alpha=0.3)
     ax1.set_xscale('log', base=2)
-    ax1.set_xticks(thread_counts)
-    ax1.set_xticklabels(thread_counts)
+    ax1.set_xticks(threads_counts)
+    ax1.set_xticklabels(threads_counts)
     
     # Plot Read Results
-    ax2.plot(thread_counts, read_avg, 'o-', label='Average', linewidth=2, markersize=8, color='orange')
-    ax2.plot(thread_counts, read_median, 's-', label='Median', linewidth=2, markersize=8, color='red')
-    ax2.fill_between(thread_counts, read_min, read_max, alpha=0.2, label='Min-Max Range', color='orange')
+    ax2.plot(threads_counts, read_avg, 'o-', label='Average', linewidth=2, markersize=8, color='orange')
+    ax2.plot(threads_counts, read_median, 's-', label='Median', linewidth=2, markersize=8, color='red')
+    ax2.fill_between(threads_counts, read_min, read_max, alpha=0.2, label='Min-Max Range', color='orange')
     ax2.set_xlabel('Number of Threads', fontsize=12)
     ax2.set_ylabel('Throughput (GB/s)', fontsize=12)
     ax2.set_title('Read Throughput vs Thread Count', fontsize=14, fontweight='bold')
@@ -84,8 +83,8 @@ def plot_results_threads_comparison(results_file='compare_file_operations/result
              fontsize=9, ha='center', va='top', style='italic', color='#555555')
     ax2.grid(True, alpha=0.3)
     ax2.set_xscale('log', base=2)
-    ax2.set_xticks(thread_counts)
-    ax2.set_xticklabels(thread_counts)
+    ax2.set_xticks(threads_counts)
+    ax2.set_xticklabels(threads_counts)
     
     plt.tight_layout(rect=(0, 0.08, 1, 1))
     
@@ -110,7 +109,7 @@ def plot_throughput_tables(results_file='compare_file_operations_results/block_s
     config = results['config']
     
     # Extract configuration
-    thread_counts = config['thread_counts']
+    threads_counts = config['threads_counts']
     block_sizes_mb = config['block_sizes_mb']
     total_data_gb = config.get('total_data_size_gb', 'Unknown')
     num_iterations = config['num_iterations']
@@ -147,7 +146,7 @@ def plot_throughput_tables(results_file='compare_file_operations_results/block_s
         best_position = None
         
         # NEW STRUCTURE: operation_data[block_size][thread_count]
-        for thread_count in thread_counts:
+        for thread_count in threads_counts:
             row = f"{thread_count:>7} |"
             thread_key = str(thread_count)
             
@@ -204,14 +203,14 @@ def plot_throughput_tables(results_file='compare_file_operations_results/block_s
     def create_mpl_table(ax, operation_data, operation_name):
         # Prepare data for table
         col_labels = [f'{bs}MB' for bs in block_sizes_mb]
-        row_labels = [f'{tc} threads' for tc in thread_counts]
+        row_labels = [f'{tc} threads' for tc in threads_counts]
         
         cell_data = []
         cell_colors = []
         
         max_throughput = 0
         # NEW STRUCTURE: operation_data[block_size][thread_count]
-        for thread_count in thread_counts:
+        for thread_count in threads_counts:
             row = []
             thread_key = str(thread_count)
             
@@ -288,7 +287,7 @@ def plot_block_size_heatmaps(results_file='compare_file_operations_results/block
     config = results['config']
     
     # Extract configuration
-    thread_counts = config['thread_counts']
+    threads_counts = config['threads_counts']
     block_sizes_mb = config['block_sizes_mb']
     total_data_gb = config.get('total_data_size_gb', 'Unknown')
     buffer_size_gb = config['buffer_size'] / (1024**3)
@@ -303,7 +302,7 @@ def plot_block_size_heatmaps(results_file='compare_file_operations_results/block
     def create_throughput_matrix(operation_data):
         matrix = []
         # NEW STRUCTURE: operation_data[block_size][thread_count]
-        for thread_count in thread_counts:
+        for thread_count in threads_counts:
             row = []
             thread_key = str(thread_count)
             
@@ -336,15 +335,15 @@ def plot_block_size_heatmaps(results_file='compare_file_operations_results/block
     im1 = ax1.imshow(write_matrix, cmap='YlOrRd', aspect='auto')
     ax1.set_xticks(range(len(block_sizes_mb)))
     ax1.set_xticklabels([f'{bs}MB' for bs in block_sizes_mb], rotation=45, ha='right')
-    ax1.set_yticks(range(len(thread_counts)))
-    ax1.set_yticklabels([f'{tc}' for tc in thread_counts])
+    ax1.set_yticks(range(len(threads_counts)))
+    ax1.set_yticklabels([f'{tc}' for tc in threads_counts])
     ax1.set_xlabel('Block Size', fontsize=12)
     ax1.set_ylabel('Number of Threads', fontsize=12)
     ax1.set_title('Write Throughput (GB/s)', fontsize=14, fontweight='bold', pad=10)
     
     # Add values to cells with better visibility
     max_write = max(max(row) for row in write_matrix)
-    for i in range(len(thread_counts)):
+    for i in range(len(threads_counts)):
         for j in range(len(block_sizes_mb)):
             if write_matrix[i][j] > 0:
                 # Use white text for darker backgrounds, black for lighter
@@ -363,15 +362,15 @@ def plot_block_size_heatmaps(results_file='compare_file_operations_results/block
     im2 = ax2.imshow(read_matrix, cmap='YlGnBu', aspect='auto')
     ax2.set_xticks(range(len(block_sizes_mb)))
     ax2.set_xticklabels([f'{bs}MB' for bs in block_sizes_mb], rotation=45, ha='right')
-    ax2.set_yticks(range(len(thread_counts)))
-    ax2.set_yticklabels([f'{tc}' for tc in thread_counts])
+    ax2.set_yticks(range(len(threads_counts)))
+    ax2.set_yticklabels([f'{tc}' for tc in threads_counts])
     ax2.set_xlabel('Block Size', fontsize=12)
     ax2.set_ylabel('Number of Threads', fontsize=12)
     ax2.set_title('Read Throughput (GB/s)', fontsize=14, fontweight='bold', pad=10)
     
     # Add values to cells with better visibility
     max_read = max(max(row) for row in read_matrix)
-    for i in range(len(thread_counts)):
+    for i in range(len(threads_counts)):
         for j in range(len(block_sizes_mb)):
             if read_matrix[i][j] > 0:
                 # Use white text for darker backgrounds, black for lighter
@@ -400,7 +399,7 @@ def plot_block_size_heatmaps(results_file='compare_file_operations_results/block
     print("Heatmap plotting complete!")
 
 
-def plot_block_size_throughput_by_threads(results_files):
+def plot_blocks_throughput_by_threads(results_files):
     """Create 6 plots (2 operations × 3 thread counts) showing throughput vs block size.
     
     Each plot shows throughput as a function of block size for a specific operation and thread count.
@@ -436,7 +435,7 @@ def plot_block_size_throughput_by_threads(results_files):
     # Extract configuration from first file (assume all have same structure)
     config1 = all_results[0]['config']
     cluster = config1['cluster']
-    thread_counts = config1['thread_counts']
+    threads_counts = config1['threads_counts']
     block_sizes_mb = config1['block_sizes_mb']
     num_blocks = config1['num_blocks']
     num_iterations = config1['num_iterations']
@@ -470,7 +469,7 @@ def plot_block_size_throughput_by_threads(results_files):
                   ('read', all_read_data, 'Read')]
     
     for row_idx, (op_name, op_data_list, op_label) in enumerate(operations):
-        for col_idx, thread_count in enumerate(thread_counts):
+        for col_idx, thread_count in enumerate(threads_counts):
             ax = axes[row_idx, col_idx]
             thread_key = str(thread_count)
             
@@ -586,7 +585,7 @@ def plot_total_data_throughput_by_threads(results_files):
     # Extract configuration from first file (assume all have same structure)
     config1 = all_results[0]['config']
     cluster = config1.get('cluster', 'Unknown')
-    thread_counts = config1['thread_counts']
+    threads_counts = config1['threads_counts']
     block_sizes_mb = config1['block_sizes_mb']
     total_data_gb = config1['total_data_size_gb']
     num_iterations = config1['num_iterations']
@@ -623,7 +622,7 @@ def plot_total_data_throughput_by_threads(results_files):
                   ('read', all_read_data, 'Read')]
 
     for row_idx, (op_name, op_data_list, op_label) in enumerate(operations):
-        for col_idx, thread_count in enumerate(thread_counts):
+        for col_idx, thread_count in enumerate(threads_counts):
             ax = axes[row_idx, col_idx]
             thread_key = str(thread_count)
 
@@ -708,27 +707,36 @@ def plot_total_data_throughput_by_threads(results_files):
     print("Total-data throughput plotting complete!")
 
 
+def main(mode, file_names):
+    """Main function to generate plots based on mode and file names.
+    
+    Args:
+        mode: Either 'blocks' or 'data'
+            - 'blocks': Calls plot_blocks_throughput_by_threads
+            - 'data': Calls plot_total_data_throughput_by_threads
+        file_names: List of result file paths to plot
+    """
+    if mode == 'blocks':
+        plot_blocks_throughput_by_threads(file_names)
+    elif mode == 'data':
+        plot_total_data_throughput_by_threads(file_names)
+    else:
+        raise ValueError(f"Invalid mode '{mode}'. Must be either 'blocks' or 'data'.")
+
+
 if __name__ == "__main__":
-    # Generate plots
-    # plot_results_threads_comparison()
+    import sys
     
-    # Generate block size comparison plots
-    # results_file = 'compare_file_operations/results/block_size_comparison_10gb.json'
-    # plot_throughput_tables(results_file)
-    # plot_block_size_heatmaps(results_file)
-    
-    # Generate throughput vs block size plots for 1000 blocks test
-    results_file_python = './results/storage_5000blocks/storage_python_self_implementation.json'
-    results_file_aiofiles = './results/storage_5000blocks/storage_2_python_aiofiles.json'
-    results_file_nixl = './results/storage_5000blocks/storage_2_nixl.json'
-    results_file_or = './results/storage_5000blocks/storage_2_python_or.json'
-    results_file_cpp = './results/storage_5000blocks/storage_2_C++.json'
-    results_file_best = './results/storage_5000blocks/storage_2_python_best.json'
-    total_cpp = './results/total_100gb/total_100gb_memory_C++.json'
-    total_python = './results/total_100gb/total_100gb_memory_python_best.json'
-
-    # Now accepts a list of results files
-    # plot_block_size_throughput_by_threads(results_files=[results_file_cpp, results_file_best, results_file_nixl, results_file_aiofiles])
-    # plot_block_size_throughput_by_threads([results_file_best,results_file_or,results_file_python])
-
-    plot_total_data_throughput_by_threads([total_cpp,total_python])
+    # Check if command line arguments are provided
+    if len(sys.argv) >= 3:
+        mode = sys.argv[1]
+        file_names = sys.argv[2:]
+        main(mode, file_names)
+    else:
+        # Default behavior for backward compatibility
+        print("Usage: python plotter.py <mode> <file1> [file2] [file3] ...")
+        print("  mode: 'blocks' or 'data'")
+        print("  files: One or more JSON result files to plot")
+        print("\nExample:")
+        print("  python plotter.py blocks results/file1.json results/file2.json")
+        print("  python plotter.py data results/total1.json results/total2.json")
