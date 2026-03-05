@@ -13,7 +13,7 @@ def set_thread_count_cpp(num_threads):
     cpp_ext.set_thread_count(num_threads)
 
 
-async def cpp_write_blocks(block_size, buffer, block_indices, dest_files, view):
+async def cpp_write_blocks(block_size, buffer, block_indices, dest_files):
     """C++ implementation wrapper for writing blocks.
     
     The C++ function handles threading internally and releases the GIL,
@@ -32,7 +32,7 @@ async def cpp_write_blocks(block_size, buffer, block_indices, dest_files, view):
         return
     return (end-start)
 
-async def cpp_read_blocks(block_size, buffer, block_indices, dest_files, view):
+async def cpp_read_blocks(block_size, buffer, block_indices, dest_files):
     """C++ implementation wrapper for reading blocks.
     
     The C++ function handles threading internally and releases the GIL,

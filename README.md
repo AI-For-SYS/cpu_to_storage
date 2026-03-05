@@ -139,5 +139,4 @@ python plotter.py data results/data_example_100gb_memory_cpp.json results/data_e
 
 This will generate a comparison plot showing throughput vs block size for all three implementations:
 
-![Throughput Comparison](plots/data_example_100gb_memory_cpp_vs_total_throughput_plots.png)
-```
+![Throughput Comparison](plots/data_example_100gb_memory_cpp_3way_total_throughput_plots.png)
