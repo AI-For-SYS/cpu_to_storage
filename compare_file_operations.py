@@ -1,79 +1,19 @@
 import asyncio
-from typing import Any
-from concurrent.futures import ThreadPoolExecutor
 import time
-import os
 import statistics
-import torch
 import random
 import argparse
 
-from checkpoints_utils import save_incremental_results, load_existing_results, check_config_match, get_completed_tests
-from backends.nixl_backend import nixl_write_blocks, nixl_read_blocks, nixl_register_buffer, nixl_unregister_buffer, _get_read_agent, _get_write_agent
-from backends.aiofiles_backend import aiofiles_write_blocks, aiofiles_read_blocks
-from backends.python_self_backend import python_self_write_blocks, python_self_read_blocks
-from backends.cpp_backend import cpp_write_blocks, cpp_read_blocks, set_thread_count_cpp, CPP_AVAILABLE
-
-# Storage path configuration - can be overridden by STORAGE_PATH environment variable
-STORAGE_PATH = os.environ.get('STORAGE_PATH', '/dev/shm')
-CLUSTER = os.environ.get('CLUSTER_NAME', 'unknown')
-PYTHON_BACKENDS = ["python_aiofiles", "python_self_implementation", "nixl"]
-
-def generate_dest_file_names(num_files):
-    return [f"{STORAGE_PATH}/final_{j}.bin" for j in range(num_files)]
-
-def verify_file(original_data, filename):
-    if not os.path.exists(filename):
-        print(f"File {filename} does not exist")
-        return False
-    
-    with open(filename, "rb") as f:
-        file_data = f.read()
-    
-    # Convert memoryview to bytes
-    original_bytes = bytes(original_data)
-    
-    # Check size first for better error messages
-    if len(file_data) != len(original_bytes):
-        print(f"Size mismatch in {filename}: file has {len(file_data)} bytes, expected {len(original_bytes)} bytes")
-        return False
-    
-    return file_data == original_bytes
-
-def verify_op(block_size, block_indices, view, dest_files, operation="operation", verify=False):
-    if not verify:
-        return
-    
-    for i, block_inx in enumerate(block_indices):
-        start_byte = block_inx * block_size
-        end_byte = (block_inx + 1) * block_size
-        if not verify_file(view[start_byte:end_byte], dest_files[i]):
-            print(f"{operation} block {block_inx} Failed")
-            return
-    
-    print(f"Verified {operation} blocks")
-
-def clean_files(file_names):
-    for file_name in file_names:
-        try:
-            if os.path.exists(file_name):
-                os.remove(file_name)
-        except Exception as e:
-            print(f"    Warning: Could not remove {file_name}: {e}")
+from utils.config import STORAGE_PATH, CLUSTER, PYTHON_BACKENDS
+from utils.file_utils import generate_dest_file_names, clean_files
+from utils.cache_clear_utils import setup_cleaning_files, write_cleaning_blocks
+from utils.benchmark_core import (
+    create_benchmark_config, load_or_create_results, setup_executor, allocate_buffers,
+    shutdown_executor, save_results, print_benchmark_summary, run_benchmark_iteration
+)
+from backends.cpp_backend import CPP_AVAILABLE
 
 async def blocks_benchmark(num_blocks, iterations, buffer_size, implementation, test_name, block_sizes_mb, threads_counts, verify=False):
-    """Benchmark different block sizes across multiple thread counts.
-    
-    Args:
-        num_blocks: number of blocks to transfer in each test
-        iterations: Number of iterations per test (default: 5)
-        buffer_size: Size of buffer in bytes
-        implementation: Implementation to test
-        test_name: Output file name prefix
-        threads_counts: List of thread counts to test (default: [16, 32, 64])
-        block_sizes_mb: List of block sizes in MB to test (default: [2, 4, 8, 16, 32])
-        verify: Whether to verify file contents after operations (default: False)
-    """
     start_time = time.perf_counter()
 
     if implementation=="cpp":
@@ -86,56 +26,24 @@ async def blocks_benchmark(num_blocks, iterations, buffer_size, implementation, 
         print(f"Buffer is not large enugh, missing {diff} mb")
         return
 
-    # Calculate total combinations
     total_combinations = len(block_sizes_mb) * len(threads_counts)
     print(f"Testing {total_combinations} combinations ({len(block_sizes_mb)} block sizes × {len(threads_counts)} threads)")
     
     output_file = f'results/blocks_{test_name}_{implementation}_{num_blocks}blocks.json'
-    existing_results: dict[Any, Any] | None = load_existing_results(output_file)
     
-    # Store results - structure: results[thread_count][block_size] = time
-    write_results = {}
-    read_results = {}
+    config = create_benchmark_config(
+        buffer_size, iterations, threads_counts, block_sizes_mb, implementation,
+        num_blocks=num_blocks
+    )
     
-    # Configuration for this benchmark
-    config = {
-        'cluster': CLUSTER,
-        'buffer_size': buffer_size,
-        'num_iterations': iterations,
-        'num_blocks': num_blocks,
-        'thread_counts': threads_counts,
-        'block_sizes_mb': block_sizes_mb,
-        'file_system': f'{STORAGE_PATH} ({"tmpfs" if STORAGE_PATH == "/dev/shm" else "persistent storage"})',
-        'implementation': implementation
-    }
+    write_results, read_results, completed_write, completed_read = load_or_create_results(output_file, config)
     
-    # Check if we can resume from existing results
-    completed_write = set()
-    completed_read = set()
+    buffer, buffer_cleaning, view, view_cleaning = allocate_buffers(buffer_size, verify)
+    file_names = generate_dest_file_names("final", num_blocks)
     
-    if existing_results and 'config' in existing_results:
-        if check_config_match(existing_results['config'], config):
-            print(f"Found existing results with matching configuration!")
-            print(f"Resuming benchmark from previous state...\n")
-            write_results = existing_results.get('write', {})
-            read_results = existing_results.get('read', {})
-            completed_write = get_completed_tests(existing_results, 'write')
-            completed_read = get_completed_tests(existing_results, 'read')
-            print(f"Already completed: {len(completed_write)} write tests, {len(completed_read)} read tests")
-        else:
-            print(f"Existing results found but configuration doesn't match.")
-            print(f"Starting fresh benchmark...\n")
-    else:
-        print(f"No existing results found. Starting fresh benchmark...\n")
+    file_names_cleaning, indices_cleaning, block_size_cleaning = setup_cleaning_files()
     
-    # Allocate buffer once
-    num_elements = buffer_size // 2
-    print("Allocating buffer...")
-    buffer = torch.zeros(num_elements, dtype=torch.float16, device='cpu', pin_memory=True)
-    print("Buffer allocated\n")
-    view: memoryview[int] = memoryview(buffer.numpy()).cast('B')
- 
-    file_names = generate_dest_file_names(num_blocks)
+    await write_cleaning_blocks(block_size_cleaning, view_cleaning, indices_cleaning, file_names_cleaning)
 
     combination_count = 0
     
@@ -146,13 +54,7 @@ async def blocks_benchmark(num_blocks, iterations, buffer_size, implementation, 
         if str(num_threads) not in read_results:
             read_results[str(num_threads)] = {}
 
-        # Set up thread pool executor
-        if implementation=="cpp":
-            set_thread_count_cpp(num_threads)
-        else:
-            loop = asyncio.get_running_loop()
-            executor = ThreadPoolExecutor(max_workers=num_threads)
-            loop.set_default_executor(executor)
+        executor = setup_executor(implementation, num_threads)
 
         for block_size_mb in block_sizes_mb:
             block_size = block_size_mb * 1024 * 1024
@@ -175,35 +77,11 @@ async def blocks_benchmark(num_blocks, iterations, buffer_size, implementation, 
                 blocks_indices_write = random.sample(range(buffer_size // block_size), num_blocks)
                 blocks_indices_read = random.sample(range(buffer_size // block_size), num_blocks)
 
-                if implementation=="cpp":
-                    time_write = await cpp_write_blocks(block_size, buffer, blocks_indices_write, file_names, view)
-                    verify_op(block_size, blocks_indices_write, view, file_names, "Writing", verify)
-
-                    time_read = await cpp_read_blocks(block_size, buffer, blocks_indices_read, file_names, view)
-
-                elif implementation=="python_aiofiles":
-                    time_write = await aiofiles_write_blocks(block_size, view, blocks_indices_write, file_names)
-                    verify_op(block_size, blocks_indices_write, view, file_names, "Writing", verify)
-
-                    time_read = await aiofiles_read_blocks(block_size, view, blocks_indices_read, file_names)
-
-                elif implementation=="nixl":
-                    reg_handler_write = nixl_register_buffer(_get_write_agent(), buffer)
-                    time_write = nixl_write_blocks(block_size, buffer, blocks_indices_write, file_names)
-                    verify_op(block_size, blocks_indices_write, view, file_names, "Writing", verify)
-                    nixl_unregister_buffer(_get_write_agent(), reg_handler_write)
-
-                    reg_handler_read = nixl_register_buffer(_get_read_agent(), buffer)
-                    time_read = nixl_read_blocks(block_size, buffer, blocks_indices_read, file_names)
-                    nixl_unregister_buffer(_get_read_agent(), reg_handler_read)
-                           
-                else:
-                    time_write = await python_self_write_blocks(block_size, view, blocks_indices_write, file_names)
-                    verify_op(block_size, blocks_indices_write, view, file_names, "Writing", verify)
-
-                    time_read = await python_self_read_blocks(block_size, view, blocks_indices_read, file_names)
-       
-                verify_op(block_size, blocks_indices_read, view, file_names, "Reading", verify)
+                time_write, time_read = await run_benchmark_iteration(
+                    implementation, block_size, buffer, buffer_cleaning, view, view_cleaning,
+                    blocks_indices_write, blocks_indices_read, file_names,
+                    file_names_cleaning, indices_cleaning, block_size_cleaning, verify
+                )
 
                 times_write.append(time_write)
                 times_read.append(time_read)
@@ -221,49 +99,20 @@ async def blocks_benchmark(num_blocks, iterations, buffer_size, implementation, 
             print(f"    Read:  {avg_read*1000:.2f}ms ({read_throughput:.2f} GB/s)")
             
             # Save results incrementally after each test
-            current_results = {
-                'config': config,
-                'write': write_results,
-                'read': read_results
-            }
-            save_incremental_results(output_file, current_results)
+            save_results(output_file, config, write_results, read_results)
             print(f"    Results saved to {output_file}")
         
-        # Shutdown executor
-        if implementation in PYTHON_BACKENDS:
-            executor.shutdown(wait=True)
+        shutdown_executor(implementation, executor)
             
-    # Final save with complete results
-    all_results = {
-        'config': config,
-        'write': write_results,
-        'read': read_results
-    }
-    
-    save_incremental_results(output_file, all_results)
+    all_results = save_results(output_file, config, write_results, read_results)
     
     total_time = time.perf_counter() - start_time
-    print(f"\n{'='*80}")
-    print(f"Benchmark complete! Total time: {total_time:.2f}s")
-    print(f"Results saved to {output_file}")
-    print(f"{'='*80}")
+    print_benchmark_summary(total_time, output_file)
     
     return all_results
 
 
 async def total_data_benchmark(total_gb, iterations, buffer_size, implementation, test_name, block_sizes_mb, threads_counts, verify=False):
-    """Benchmark different block sizes across multiple thread counts.
-    
-    Args:
-        total_gb: Total data size in GB to transfer for each test
-        iterations: Number of iterations per test
-        buffer_size: Size of buffer in bytes
-        implementation: Implementation to test
-        test_name: Output file name prefix
-        thread_counts: List of thread counts to test (default: [16, 32, 64])
-        block_sizes_mb: List of block sizes in MB to test (default: [2, 4, 8, 16, 32, 64])
-        verify: Whether to verify file contents after operations (default: False)
-    """
     start_time = time.perf_counter()
 
     if implementation=="cpp":
@@ -271,55 +120,23 @@ async def total_data_benchmark(total_gb, iterations, buffer_size, implementation
             print("cpp implementation not available.")
             return
 
-    # Calculate total combinations
     total_combinations = len(block_sizes_mb) * len(threads_counts)
     print(f"Testing {total_combinations} combinations ({len(block_sizes_mb)} block sizes × {len(threads_counts)} threads)")
     print(f"Fixed total data size per test: {total_gb} GB)")
     
     output_file = f'results/data_{test_name}_{total_gb}gb_memory_{implementation}.json'
-    existing_results = load_existing_results(output_file)
     
-    # Store results - structure: results[block_size][thread_count] = time
-    write_results = {}
-    read_results = {}
+    config = create_benchmark_config(
+        buffer_size, iterations, threads_counts, block_sizes_mb, implementation,
+        total_data_size_gb=total_gb
+    )
     
-    # Configuration for this benchmark
-    config = {
-        'cluster': CLUSTER,
-        'buffer_size': buffer_size,
-        'num_iterations': iterations,
-        'total_data_size_gb': total_gb,
-        'threads_counts': threads_counts,
-        'block_sizes_mb': block_sizes_mb,
-        'file_system': f'{STORAGE_PATH} ({"tmpfs" if STORAGE_PATH == "/dev/shm" else "persistent storage"})',
-        'implementation': implementation
-    }
+    write_results, read_results, completed_write, completed_read = load_or_create_results(output_file, config)
     
-    # Check if we can resume from existing results
-    completed_write = set()
-    completed_read = set()
+    buffer, buffer_cleaning, view, view_cleaning = allocate_buffers(buffer_size, verify)
+    file_names_cleaning, indices_cleaning, block_size_cleaning = setup_cleaning_files()
     
-    if existing_results and 'config' in existing_results:
-        if check_config_match(existing_results['config'], config):
-            print(f"Found existing results with matching configuration!")
-            print(f"Resuming benchmark from previous state...\n")
-            write_results = existing_results.get('write', {})
-            read_results = existing_results.get('read', {})
-            completed_write = get_completed_tests(existing_results, 'write')
-            completed_read = get_completed_tests(existing_results, 'read')
-            print(f"Already completed: {len(completed_write)} write tests, {len(completed_read)} read tests")
-        else:
-            print(f"Existing results found but configuration doesn't match.")
-            print(f"Starting fresh benchmark...\n")
-    else:
-        print(f"No existing results found. Starting fresh benchmark...\n")
-    
-    # Allocate buffer once
-    num_elements = buffer_size // 2
-    print("Allocating buffer...")
-    buffer = torch.zeros(num_elements, dtype=torch.float16, device='cpu', pin_memory=True)
-    print("Buffer allocated\n")
-    view: memoryview[int] = memoryview(buffer.numpy()).cast('B')
+    await write_cleaning_blocks(block_size_cleaning, view_cleaning, indices_cleaning, file_names_cleaning)
 
     combination_count = 0
     
@@ -330,13 +147,7 @@ async def total_data_benchmark(total_gb, iterations, buffer_size, implementation
         if str(num_threads) not in read_results:
             read_results[str(num_threads)] = {}
         
-                # Set up thread pool executor
-        if implementation=="cpp":
-            set_thread_count_cpp(num_threads)
-        else:
-            loop = asyncio.get_running_loop()
-            executor = ThreadPoolExecutor(max_workers=num_threads)
-            loop.set_default_executor(executor)
+        executor = setup_executor(implementation, num_threads)
         
         for block_size_mb in block_sizes_mb:
 
@@ -348,7 +159,7 @@ async def total_data_benchmark(total_gb, iterations, buffer_size, implementation
             block_size = block_size_mb * 1024 * 1024
             
             # Check if this combination is already completed
-            test_key = (str(block_size), str(num_threads))
+            test_key = (str(num_threads), str(block_size_mb))
             if test_key in completed_write and test_key in completed_read:
                 print(f"\n  [{combination_count}/{total_combinations}] Threads: {num_threads} - SKIPPED (already completed)")
                 continue
@@ -356,7 +167,7 @@ async def total_data_benchmark(total_gb, iterations, buffer_size, implementation
             print(f"\n  [{combination_count}/{total_combinations}] Threads: {num_threads}")
             
             # Generate file names
-            file_names = generate_dest_file_names(num_blocks_to_copy)
+            file_names = generate_dest_file_names("final", num_blocks_to_copy)
             
             times_write = []
             times_read = []
@@ -365,34 +176,11 @@ async def total_data_benchmark(total_gb, iterations, buffer_size, implementation
                 blocks_indices_write = random.sample(range(buffer_size // block_size), num_blocks_to_copy)
                 blocks_indices_read = random.sample(range(buffer_size // block_size), num_blocks_to_copy)
                 
-                if implementation=="cpp":
-                    time_write = await cpp_write_blocks(block_size, buffer, blocks_indices_write, file_names, view)
-                    verify_op(block_size, blocks_indices_write, view, file_names, "Writing", verify)
-
-                    time_read = await cpp_read_blocks(block_size, buffer, blocks_indices_read, file_names, view)
-                
-                elif implementation=="python_aiofiles":
-                    time_write = await aiofiles_write_blocks(block_size, view, blocks_indices_write, file_names)
-                    verify_op(block_size, blocks_indices_write, view, file_names, "Writing", verify)
-
-                    time_read = await aiofiles_read_blocks(block_size, view, blocks_indices_read, file_names)
-                
-                elif implementation=="nixl":
-                    reg_handler_write = nixl_register_buffer(_get_write_agent(), buffer)
-                    time_write = nixl_write_blocks(block_size, buffer, blocks_indices_write, file_names)
-                    verify_op(block_size, blocks_indices_write, view, file_names, "Writing", verify)
-                    nixl_unregister_buffer(_get_write_agent(), reg_handler_write)
-
-                    reg_handler_read = nixl_register_buffer(_get_read_agent(), buffer)
-                    time_read = nixl_read_blocks(block_size, buffer, blocks_indices_read, file_names)
-                    nixl_unregister_buffer(_get_read_agent(), reg_handler_read)
-                else:
-                    time_write = await python_self_write_blocks(block_size, view, blocks_indices_write, file_names)
-                    verify_op(block_size, blocks_indices_write, view, file_names, "Writing", verify)
-
-                    time_read = await python_self_read_blocks(block_size, view, blocks_indices_read, file_names)
-         
-                verify_op(block_size, blocks_indices_read, view, file_names, "Reading", verify)
+                time_write, time_read = await run_benchmark_iteration(
+                    implementation, block_size, buffer, buffer_cleaning, view, view_cleaning,
+                    blocks_indices_write, blocks_indices_read, file_names,
+                    file_names_cleaning, indices_cleaning, block_size_cleaning, verify
+                )
                 
                 times_write.append(time_write)
                 times_read.append(time_read)
@@ -412,31 +200,15 @@ async def total_data_benchmark(total_gb, iterations, buffer_size, implementation
             print(f"    Read:  {avg_read*1000:.2f}ms ({read_throughput:.2f} GB/s)")
             
             # Save results incrementally after each test
-            current_results = {
-                'config': config,
-                'write': write_results,
-                'read': read_results
-            }
-            save_incremental_results(output_file, current_results)
+            save_results(output_file, config, write_results, read_results)
             print(f"    Results saved to {output_file}")
         
-        if implementation in PYTHON_BACKENDS:
-            executor.shutdown(wait=True)
+        shutdown_executor(implementation, executor)
     
-    # Final save with complete results
-    all_results = {
-        'config': config,
-        'write': write_results,
-        'read': read_results
-    }
-    
-    save_incremental_results(output_file, all_results)
+    all_results = save_results(output_file, config, write_results, read_results)
     
     total_time = time.perf_counter() - start_time
-    print(f"\n{'='*80}")
-    print(f"Benchmark complete! Total time: {total_time:.2f}s")
-    print(f"Results saved to {output_file}")
-    print(f"{'='*80}")
+    print_benchmark_summary(total_time, output_file)
     
     return all_results
 
@@ -458,9 +230,9 @@ if __name__ == "__main__":
     parser.add_argument(
         '--backend',
         type=str,
-        choices=['cpp', 'python_aiofiles', 'python_self_implementation', 'nixl'],
-        default='python_self_implementation',
-        help='I/O backend to benchmark (default: python_self_implementation)'
+        choices=['cpp', 'python_aiofiles', 'python_self_imp', 'nixl'],
+        default='python_self_imp',
+        help='I/O backend to benchmark (default: python_self_imp)'
     )
     parser.add_argument(
         '--buffer-size',

@@ -42,6 +42,7 @@ kubectl cp compare_file_operations.py "$NAMESPACE/$POD_NAME:$DEST_PATH/"
 kubectl cp setup.py "$NAMESPACE/$POD_NAME:$DEST_PATH/"
 kubectl cp checkpoints_utils.py "$NAMESPACE/$POD_NAME:$DEST_PATH/"
 kubectl cp backends "$NAMESPACE/$POD_NAME:$DEST_PATH/"
+kubectl cp utils "$NAMESPACE/$POD_NAME:$DEST_PATH/"
 
 echo "Files copied to $DEST_PATH in pod $POD_NAME"
 echo ""

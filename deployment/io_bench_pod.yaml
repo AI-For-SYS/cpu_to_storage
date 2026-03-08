@@ -37,11 +37,11 @@ spec:
           fieldPath: metadata.labels['cluster']
     resources:
       requests:
-        memory: "300Gi"
+        memory: "450Gi"
         cpu: "12"
         nvidia.com/gpu: "1"
       limits:
-        memory: "300Gi"
+        memory: "450Gi"
         cpu: "128"
         nvidia.com/gpu: "1"
     volumeMounts:
@@ -53,7 +53,7 @@ spec:
   - name: dshm
     emptyDir:
       medium: Memory
-      sizeLimit: "300Gi" # Adjust based on 'buffer_size' variable
+      sizeLimit: "450Gi" # Adjust based on 'buffer_size' variable
   - name: persistent-storage
     persistentVolumeClaim:
       claimName: io-benchmark-pvc
