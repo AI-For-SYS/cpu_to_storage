@@ -6,6 +6,12 @@ from checkpoints_utils import save_incremental_results, load_existing_results, c
 from backends.cpp_backend import set_thread_count_cpp
 from utils.config import PYTHON_BACKENDS, CLUSTER, STORAGE_PATH
 import torch
+from backends.cpp_backend import cpp_write_blocks, cpp_read_blocks
+from backends.aiofiles_backend import aiofiles_write_blocks, aiofiles_read_blocks
+from backends.python_self_backend import python_self_write_blocks, python_self_read_blocks
+from backends.nixl_backend import nixl_write_blocks, nixl_read_blocks, nixl_register_buffer, nixl_unregister_buffer, _get_read_agent, _get_write_agent
+from utils.file_utils import verify_op
+import time
 
 def create_benchmark_config(buffer_size, iterations, threads_counts, block_sizes_mb, implementation, **kwargs):
     """Create configuration dictionary for benchmark."""
@@ -85,6 +91,13 @@ def print_benchmark_summary(total_time, output_file):
     print(f"Results saved to {output_file}")
     print(f"{'='*80}")
 
+def setup_cleaning_files():
+    """Setup file names and indices for cache cleaning operations."""
+    file_names_cleaning: list[str] = [f"/dev/shm/cleaning_{j}.bin" for j in range(3200)]
+    indices_cleaning = list(range(3200))
+    block_size_cleaning = 32*1024*1024
+    
+    return file_names_cleaning, indices_cleaning, block_size_cleaning
 
 async def run_benchmark_iteration(
     implementation, block_size, buffer, buffer_cleaning, view, view_cleaning,
@@ -92,11 +105,7 @@ async def run_benchmark_iteration(
     file_names_cleaning, indices_cleaning, block_size_cleaning, verify
 ):
     """Run a single benchmark iteration for write and read operations."""
-    from backends.cpp_backend import cpp_write_blocks, cpp_read_blocks
-    from backends.aiofiles_backend import aiofiles_write_blocks, aiofiles_read_blocks
-    from backends.python_self_backend import python_self_write_blocks, python_self_read_blocks
-    from backends.nixl_backend import nixl_write_blocks, nixl_read_blocks, nixl_register_buffer, nixl_unregister_buffer, _get_read_agent, _get_write_agent
-    from utils.file_utils import verify_op
+
     
     if implementation == "cpp":
         time_write = await cpp_write_blocks(block_size, buffer, blocks_indices_write, file_names)
@@ -159,6 +168,74 @@ async def run_benchmark_iteration(
         await python_self_read_blocks(block_size_cleaning, view_cleaning, indices_cleaning, file_names_cleaning)
     
     return time_write, time_read
+
+
+async def run_concurrent_benchmark_iteration(
+    implementation, block_size, buffer, buffer_cleaning, view, view_cleaning,
+    blocks_indices_write, blocks_indices_read, file_names_write, file_names_read,
+    file_names_cleaning, indices_cleaning, block_size_cleaning, verify
+):
+    """Run a single benchmark iteration with concurrent read and write operations."""
+    
+    # Clean cache before concurrent operations
+    if implementation == "cpp":
+        await cpp_read_blocks(block_size_cleaning, buffer_cleaning, indices_cleaning, file_names_cleaning)
+    elif implementation == "nixl":
+        reg_handler_cleaning = nixl_register_buffer(_get_read_agent(), buffer_cleaning)
+        nixl_read_blocks(block_size_cleaning, buffer_cleaning, indices_cleaning, file_names_cleaning)
+        nixl_unregister_buffer(_get_read_agent(), reg_handler_cleaning)
+    else:
+        await python_self_read_blocks(block_size_cleaning, view_cleaning, indices_cleaning, file_names_cleaning)
+    
+    # Run concurrent read and write operations
+    start_time = time.perf_counter()
+    
+    if implementation == "cpp":
+        # Run both operations concurrently
+        write_task = cpp_write_blocks(block_size, buffer, blocks_indices_write, file_names_write)
+        read_task = cpp_read_blocks(block_size, buffer, blocks_indices_read, file_names_read)
+        time_write, time_read = await asyncio.gather(write_task, read_task)
+        
+    elif implementation == "python_aiofiles":
+        write_task = aiofiles_write_blocks(block_size, view, blocks_indices_write, file_names_write)
+        read_task = aiofiles_read_blocks(block_size, view, blocks_indices_read, file_names_read)
+        time_write, time_read = await asyncio.gather(write_task, read_task)
+        
+    elif implementation == "nixl":
+        reg_handler_write = nixl_register_buffer(_get_write_agent(), buffer)
+        reg_handler_read = nixl_register_buffer(_get_read_agent(), buffer)
+        
+        # NIXL operations are synchronous, so we need to wrap them
+        loop = asyncio.get_running_loop()
+        write_task = loop.run_in_executor(None, nixl_write_blocks, block_size, buffer, blocks_indices_write, file_names_write)
+        read_task = loop.run_in_executor(None, nixl_read_blocks, block_size, buffer, blocks_indices_read, file_names_read)
+        time_write, time_read = await asyncio.gather(write_task, read_task)
+        
+        nixl_unregister_buffer(_get_write_agent(), reg_handler_write)
+        nixl_unregister_buffer(_get_read_agent(), reg_handler_read)
+        
+    else:  # python_self_imp
+        write_task = python_self_write_blocks(block_size, view, blocks_indices_write, file_names_write)
+        read_task = python_self_read_blocks(block_size, view, blocks_indices_read, file_names_read)
+        time_write, time_read = await asyncio.gather(write_task, read_task)
+    
+    total_time = time.perf_counter() - start_time
+    
+    # Verify operations if requested
+    verify_op(block_size, blocks_indices_write, view, file_names_write, "Writing", verify)
+    verify_op(block_size, blocks_indices_read, view, file_names_read, "Reading", verify)
+    
+    # Clean cache after concurrent operations
+    if implementation == "cpp":
+        await cpp_read_blocks(block_size_cleaning, buffer_cleaning, indices_cleaning, file_names_cleaning)
+    elif implementation == "nixl":
+        reg_handler_cleaning = nixl_register_buffer(_get_read_agent(), buffer_cleaning)
+        nixl_read_blocks(block_size_cleaning, buffer_cleaning, indices_cleaning, file_names_cleaning)
+        nixl_unregister_buffer(_get_read_agent(), reg_handler_cleaning)
+    else:
+        await python_self_read_blocks(block_size_cleaning, view_cleaning, indices_cleaning, file_names_cleaning)
+    
+    return time_write, time_read, total_time
 
 
 def allocate_buffers(buffer_size, verify=False):
