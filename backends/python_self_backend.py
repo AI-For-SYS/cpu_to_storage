@@ -39,18 +39,20 @@ async def python_self_read_blocks(block_size, view, block_indices, dest_files):
     end: float = time.perf_counter()
     return (end-start)
 
-def write_block_direct(temp_name, fd, dest_name, buffer_view_slice):
-    try:
-        bytes_written = os.write(fd, buffer_view_slice)
-        os.close(fd)
-        os.replace(temp_name, dest_name)
-        return bytes_written == len(buffer_view_slice)
-    except:
-        return False
+
+def write_block(fd: int, tmp_path: str, dest_path: str,
+                    buf: memoryview, offset: int, block_size: int) -> bool:
+    total = 0
+    while total < block_size:
+        total += os.write(fd, buf[offset + total:offset + block_size])
+    os.close(fd)
+    os.replace(tmp_path, dest_path)
+    return True
+
 
 async def python_self_write_blocks(block_size, view, block_indices, dest_files):
     tasks: list[Any] = []
-    
+
     loop = asyncio.get_running_loop()
     start = time.perf_counter()
 
@@ -60,8 +62,8 @@ async def python_self_write_blocks(block_size, view, block_indices, dest_files):
     tasks = [
         loop.run_in_executor(
             None,
-            write_block_direct,
-            temp_name, fd, dest_file, view[start:start+block_size]
+            write_block,
+            fd, temp_name, dest_file, view, start, block_size
         )
         for temp_name, fd, dest_file, start in zip(temp_names, fds, dest_files, (i * block_size for i in block_indices))
     ]

@@ -157,16 +157,16 @@ async def run_benchmark_iteration(
     else:  # python_self_imp
         time_write = await python_self_write_blocks(block_size, view, blocks_indices_write, file_names)
         verify_op(block_size, blocks_indices_write, view, file_names, "Writing", verify)
-        
+
         # reading 100GB of other blocks to clean the cache
         await python_self_read_blocks(block_size_cleaning, view_cleaning, indices_cleaning, file_names_cleaning)
 
         time_read = await python_self_read_blocks(block_size, view, blocks_indices_read, file_names)
         verify_op(block_size, blocks_indices_read, view, file_names, "Reading", verify)
-        
+
         # reading 100GB of other blocks to clean the cache
         await python_self_read_blocks(block_size_cleaning, view_cleaning, indices_cleaning, file_names_cleaning)
-    
+
     return time_write, time_read
 
 
@@ -186,7 +186,7 @@ async def run_concurrent_benchmark_iteration(
         nixl_unregister_buffer(_get_read_agent(), reg_handler_cleaning)
     else:
         await python_self_read_blocks(block_size_cleaning, view_cleaning, indices_cleaning, file_names_cleaning)
-    
+
     # Run concurrent read and write operations
     start_time = time.perf_counter()
     

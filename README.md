@@ -6,6 +6,7 @@ Benchmarks for comparing different file I/O implementations in Python and C++. T
 
 1. **blocks**: Writing\reading a fixed number of *blocks* for each block size, changing the overall data for each block size.
 2. **data**: Writing\reading a fixed number of *data* (in GB), changing the number of blocks for each block size.
+3. **concurrent**: Running read and write operations simultaneously to measure combined throughput and performance under mixed workloads. Uses half the total data for reads and half for writes.
 
 Each benchmark can use one of the following I/O implementations:
 - **C++**: using custom thread pool.
@@ -55,13 +56,13 @@ python compare_file_operations.py
 
 | Argument | Type | Default | Description |
 |----------|------|---------|-------------|
-| `--mode` | str | `blocks` | Benchmark mode: `block` for testing on a fixed number of blocks or `data` for testing a fixed data size |
+| `--mode` | str | `blocks` | Benchmark mode: `blocks` for fixed number of blocks, `data` for fixed data size, or `concurrent` for simultaneous read/write |
 | `--backend` | str | `python_self_imp` | Backends: `cpp`, `python_aiofiles`, `python_self_imp`, `nixl` |
 | `--buffer-size` | int | `100` | Buffer size in GB |
 | `--block-sizes` | int list | `2 4 8 16 32 64` | Block sizes in MB to test.  |
 | `--iterations` | int | `5` | Number of iterations per test |
 | `--num-blocks` | int | `1000` | Number of blocks to transfer (blocks mode only) |
-| `--total-gb` | int | `100` | Total data size in GB (total mode only) |
+| `--total-gb` | int | `100` | Total data size in GB (data and concurrent modes) |
 | `--test-name` | str | `""` | Add to results' file name |
 | `--verify` | flag | `False` | Verify file contents after write/read operations |
 
@@ -109,7 +110,9 @@ python plotter.py <mode> <file1> [file2] [file3] ...
 
 ```
 
-## Example
+## Examples
+
+### Example 1: Data Mode Benchmark
 
 Here is an example of testing cpp, python_self and nixl's backend for writing/reading 100GB at a time from tmpfs and later plotting the results:
 
@@ -140,3 +143,38 @@ python plotter.py data results/data_example_100gb_memory_cpp.json results/data_e
 This will generate a comparison plot showing throughput vs block size for all three implementations:
 
 ![Throughput Comparison](plots/data_example_100gb_memory_cpp_3way_total_throughput_plots.png)
+
+### Example 2: Concurrent Benchmark
+
+The concurrent benchmark measures performance when read and write operations run simultaneously, simulating real-world mixed workloads:
+
+```bash
+# Run concurrent benchmark with C++ backend
+python compare_file_operations.py --mode concurrent --backend cpp --total-gb 100 --test-name concurrent_test
+
+# Run with Python self implementation
+python compare_file_operations.py --mode concurrent --backend python_self_imp --total-gb 100 --test-name concurrent_test
+```
+
+The concurrent mode:
+- Splits the total data size equally between read and write operations (e.g., 100GB total = 50GB read + 50GB write)
+- Runs both operations simultaneously to measure combined throughput
+- Reports individual read/write times and combined throughput
+- Useful for understanding how the system handles mixed I/O workloads
+
+Results will be saved to `results/concurrent_<test_name>_<total_gb>gb_<storage>_<backend>.json`.
+
+Copy the results back to local machine:
+```bash
+./copy_to_pod.sh --get-results
+```
+
+Plot the concurrent benchmark results:
+```bash
+python plotter.py concurrent results/concurrent_concurrent_test_100gb_tmpfs_cpp.json results/concurrent_concurrent_test_100gb_tmpfs_python_self_imp.json
+```
+
+The plotter will generate comparison plots showing:
+- Write throughput under concurrent load
+- Read throughput under concurrent load
+- Combined throughput for mixed workloads

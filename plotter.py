@@ -93,8 +93,6 @@ def plot_results_threads_comparison(results_file='compare_file_operations/result
     plt.savefig(output_plot, dpi=300, bbox_inches='tight')
     print(f"\nPlot saved to {output_plot}")
     plt.close()
-    
-    print("Plotting complete!")
 
 
 def plot_throughput_tables(results_file='compare_file_operations_results/block_size_comparison_10gb.json'):
@@ -395,8 +393,6 @@ def plot_block_size_heatmaps(results_file='compare_file_operations_results/block
     plt.savefig(output_png, dpi=300, bbox_inches='tight')
     print(f"\nHeatmap visualization saved to {output_png}")
     plt.close()
-    
-    print("Heatmap plotting complete!")
 
 
 def plot_blocks_throughput_by_threads(results_files):
@@ -543,8 +539,6 @@ def plot_blocks_throughput_by_threads(results_files):
     plt.savefig(output_png, dpi=300, bbox_inches='tight')
     print(f"\nThroughput plots saved to {output_png}")
     plt.close()
-    
-    print("Throughput plotting complete!")
 
 
 def plot_total_data_throughput_by_threads(results_files):
@@ -704,24 +698,201 @@ def plot_total_data_throughput_by_threads(results_files):
     print(f"\nTotal-data throughput plots saved to {output_png}")
     plt.close()
 
-    print("Total-data throughput plotting complete!")
+
+def plot_concurrent_throughput_by_threads(results_files):
+    """Create plots for concurrent read/write benchmark results.
+    
+    Shows 9 plots (3 metrics × 3 thread counts):
+    - Write throughput during concurrent operations
+    - Read throughput during concurrent operations
+    - Combined throughput (total data transferred)
+    
+    Each plot shows throughput as a function of block size for a specific metric and thread count.
+    Can compare multiple implementations on the same plots.
+    
+    Args:
+        results_files: List of paths to concurrent results JSON files
+    """
+    
+    # Ensure results_files is a list
+    if isinstance(results_files, str):
+        results_files = [results_files]
+    
+    if not results_files:
+        raise ValueError("At least one results file must be provided")
+    
+    # Load all results files
+    all_results = []
+    all_write_data = []
+    all_read_data = []
+    all_concurrent_data = []
+    all_implementations = []
+    
+    for results_file in results_files:
+        with open(results_file, 'r') as f:
+            results = json.load(f)
+        
+        all_results.append(results)
+        all_write_data.append(results['write'])
+        all_read_data.append(results['read'])
+        all_concurrent_data.append(results['concurrent'])
+        all_implementations.append(results['config'].get('implementation', 'Unknown'))
+    
+    # Extract configuration from first file
+    config1 = all_results[0]['config']
+    cluster = config1.get('cluster', 'Unknown')
+    threads_counts = config1['threads_counts']
+    block_sizes_mb = config1['block_sizes_mb']
+    total_data_gb = config1['total_data_size_gb']
+    num_iterations = config1['num_iterations']
+    buffer_size_gb = config1['buffer_size'] / (1024 ** 3)
+    file_system = config1.get('file_system', 'Unknown')
+    
+    # Create metadata text
+    if len(all_implementations) > 1:
+        implementations = " vs ".join(all_implementations)
+    else:
+        implementations = all_implementations[0]
+    
+    metadata = (f"File System: {file_system} | Comparing: {implementations}\n"
+                f"Cluster: {cluster} | Buffer: {buffer_size_gb:.1f}GB | "
+                f"Total Data: {total_data_gb}GB ({total_data_gb/2}GB read + {total_data_gb/2}GB write) | "
+                f"Iterations: {num_iterations}")
+    
+    # Create figure with 3 rows (metrics) × 3 columns (thread counts)
+    fig, axes = plt.subplots(3, 3, figsize=(18, 14))
+    num_implementations = len(all_implementations)
+    fig.suptitle(
+        f'Concurrent Read/Write Throughput - '
+        f'{num_implementations} Implementation{"s" if num_implementations > 1 else ""} Comparison',
+        fontsize=16, fontweight='bold', y=0.985)
+    
+    # Add overall metadata below the title with more spacing
+    fig.text(0.5, 0.945, metadata, ha='center', fontsize=10, style='italic', color='#555555')
+    
+    # Define colors and markers
+    colors = ['blue', 'orange', 'green', 'red', 'purple', 'brown', 'pink', 'gray', 'olive', 'cyan']
+    markers = ['o-', 's--', '^:', 'D-.', 'v-', 'p--', '*:', 'h-.', '+--', 'x:']
+    marker_sizes = [10, 8, 8, 8, 8, 8, 8, 8, 8, 8]
+    
+    # Define metrics: (data_list, label, row_index)
+    metrics = [
+        (all_write_data, 'Write (Concurrent)', 0),
+        (all_read_data, 'Read (Concurrent)', 1),
+        (all_concurrent_data, 'Combined', 2)
+    ]
+    
+    for row_idx, (data_list, metric_label, _) in enumerate(metrics):
+        for col_idx, thread_count in enumerate(threads_counts):
+            ax = axes[row_idx, col_idx]
+            thread_key = str(thread_count)
+            
+            # Plot each implementation
+            for impl_idx, (metric_data, impl_name) in enumerate(zip(data_list, all_implementations)):
+                throughputs = []
+                block_sizes_for_plot = []
+                
+                for bs_mb in block_sizes_mb:
+                    bs_key = str(bs_mb)
+                    # Structure: metric_data[thread_count][block_size_mb] = avg_time_seconds
+                    if thread_key in metric_data and bs_key in metric_data[thread_key]:
+                        avg_time = metric_data[thread_key][bs_key]
+                        
+                        # Calculate throughput based on metric type
+                        if row_idx == 2:  # Combined throughput
+                            # Total data transferred (read + write)
+                            throughput = total_data_gb / avg_time
+                        else:  # Individual write or read
+                            # Half the total data for each operation
+                            throughput = (total_data_gb / 2) / avg_time
+                        
+                        throughputs.append(throughput)
+                        block_sizes_for_plot.append(bs_mb)
+                
+                # Plot this implementation
+                color_idx = impl_idx % len(colors)
+                marker_idx = impl_idx % len(markers)
+                ax.plot(block_sizes_for_plot, throughputs, markers[marker_idx],
+                        color=colors[color_idx],
+                        linewidth=2.5, markersize=marker_sizes[marker_idx],
+                        markeredgewidth=1.5, markeredgecolor='white', label=impl_name)
+                
+                # Add value labels on points (stagger vertically for multiple implementations)
+                y_offset = 8 + (impl_idx % 3) * (-10)
+                x_offset = (impl_idx // 3) * 10
+                for bs, tp in zip(block_sizes_for_plot, throughputs):
+                    ax.annotate(f'{tp:.2f}', xy=(bs, tp),
+                                xytext=(x_offset, y_offset), textcoords='offset points',
+                                ha='center', fontsize=7, fontweight='bold',
+                                bbox=dict(boxstyle='round,pad=0.3', facecolor='white',
+                                          edgecolor=colors[color_idx], alpha=0.7))
+            
+            # Add a secondary x-axis showing number of blocks for each block size
+            ax2 = ax.twiny()
+            ax2.set_xlim(ax.get_xlim())
+            ax2.set_xticks(block_sizes_mb)
+            # For concurrent, each operation uses half the total data
+            blocks_per_operation = [(total_data_gb * 1024 / 2) / bs for bs in block_sizes_mb]
+            ax2.set_xticklabels(
+                [f'{int(blocks)}' for blocks in blocks_per_operation],
+                fontsize=7, rotation=45, ha='left')
+            ax2.set_xlabel('# Blocks (per operation)', fontsize=8, color='gray')
+            ax2.tick_params(axis='x', colors='gray')
+            
+            # Formatting
+            ax.set_xlabel('Block Size (MB)', fontsize=11, fontweight='bold')
+            ax.set_ylabel('Throughput (GB/s)', fontsize=11, fontweight='bold')
+            ax.set_title(f'{metric_label} - {thread_count} Threads',
+                         fontsize=12, fontweight='bold', pad=20)
+            ax.grid(True, alpha=0.3, linestyle='--')
+            if block_sizes_mb:
+                ax.set_xticks(block_sizes_mb)
+                ax.set_xticklabels([str(bs) for bs in block_sizes_mb])
+            
+            # Set y-axis to start from 0 for better comparison
+            ax.set_ylim(bottom=0)
+            
+            # Add legend
+            ax.legend(loc='lower right', fontsize=9)
+    
+    plt.tight_layout(rect=(0, 0.02, 1, 0.96))
+    
+    # Save figure to plots directory
+    import os
+    os.makedirs('plots', exist_ok=True)
+    
+    # Create output filename based on number of files
+    base_name = os.path.basename(results_files[0]).replace('.json', '')
+    if len(results_files) > 2:
+        output_png = f'plots/{base_name}_{len(results_files)}way_concurrent_throughput_plots.png'
+    elif len(results_files) == 2:
+        output_png = f'plots/{base_name}_vs_concurrent_throughput_plots.png'
+    else:
+        output_png = f'plots/{base_name}_concurrent_throughput_plots.png'
+    
+    plt.savefig(output_png, dpi=300, bbox_inches='tight')
+    print(f"\nConcurrent throughput plots saved to {output_png}")
+    plt.close()
 
 
 def main(mode, file_names):
     """Main function to generate plots based on mode and file names.
     
     Args:
-        mode: Either 'blocks' or 'data'
+        mode: Either 'blocks', 'data', or 'concurrent'
             - 'blocks': Calls plot_blocks_throughput_by_threads
             - 'data': Calls plot_total_data_throughput_by_threads
+            - 'concurrent': Calls plot_concurrent_throughput_by_threads
         file_names: List of result file paths to plot
     """
     if mode == 'blocks':
         plot_blocks_throughput_by_threads(file_names)
     elif mode == 'data':
         plot_total_data_throughput_by_threads(file_names)
+    elif mode == 'concurrent':
+        plot_concurrent_throughput_by_threads(file_names)
     else:
-        raise ValueError(f"Invalid mode '{mode}'. Must be either 'blocks' or 'data'.")
+        raise ValueError(f"Invalid mode '{mode}'. Must be either 'blocks', 'data', or 'concurrent'.")
 
 
 if __name__ == "__main__":
@@ -735,8 +906,9 @@ if __name__ == "__main__":
     else:
         # Default behavior for backward compatibility
         print("Usage: python plotter.py <mode> <file1> [file2] [file3] ...")
-        print("  mode: 'blocks' or 'data'")
+        print("  mode: 'blocks', 'data', or 'concurrent'")
         print("  files: One or more JSON result files to plot")
         print("\nExample:")
         print("  python plotter.py blocks results/file1.json results/file2.json")
         print("  python plotter.py data results/total1.json results/total2.json")
+        print("  python plotter.py concurrent results/concurrent1.json results/concurrent2.json")

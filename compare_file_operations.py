@@ -48,7 +48,7 @@ async def blocks_benchmark(num_blocks, iterations, buffer_size, implementation, 
     await write_blocks(block_size_cleaning, view_cleaning, indices_cleaning, file_names_cleaning)
 
     combination_count = 0
-    
+    block_sizes_mb.reverse()
     for num_threads in threads_counts:
 
         if str(num_threads) not in write_results:
