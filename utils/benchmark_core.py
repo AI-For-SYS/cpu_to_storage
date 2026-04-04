@@ -9,7 +9,12 @@ import torch
 from backends.cpp_backend import cpp_write_blocks, cpp_read_blocks
 from backends.aiofiles_backend import aiofiles_write_blocks, aiofiles_read_blocks
 from backends.python_self_backend import python_self_write_blocks, python_self_read_blocks
-from backends.nixl_backend import nixl_write_blocks, nixl_read_blocks, nixl_register_buffer, nixl_unregister_buffer, _get_read_agent, _get_write_agent
+try:
+    from backends.nixl_backend import nixl_write_blocks, nixl_read_blocks, nixl_register_buffer, nixl_unregister_buffer, _get_read_agent, _get_write_agent
+    NIXL_AVAILABLE = True
+except ImportError:
+    NIXL_AVAILABLE = False
+    print("Warning: nixl backend not available (nixl package not installed). Skipping nixl support.")
 from utils.file_utils import verify_op
 import time
 

@@ -36,6 +36,9 @@ cpu_to_storage/
 ├── setup.py                       # Builds C++ extension via PyTorch CppExtension
 ├── plotter.py                     # Result visualization (multiple plot types)
 ├── copy_to_pod.sh                 # kubectl copy helper for K8s deployment
+├── setup_env.sh                   # CCC venv setup script
+├── run_benchmark.sh               # LSF job submission script
+├── .gitignore                     # Excludes sftp config, build artifacts
 ├── README.md                      # User-facing documentation
 ├── CLAUDE.md                      # Claude Code session instructions
 ├── KNOWLEDGE_BASE.md              # This file
@@ -219,6 +222,40 @@ Usage: `python plotter.py <mode> <file1> [file2] ...`
 - **Volumes**: `/dev/shm` (450Gi tmpfs emptyDir) + `/mnt/persistent-storage` (PVC)
 - **Namespace**: `rotem`
 - **Deploy helper**: `copy_to_pod.sh` (copies source to pod, `--get-results` copies results back)
+
+---
+
+## LSF Remote Infrastructure
+
+### Setup
+- `setup_env.sh` — one-time venv creation, dependency install, C++ extension build. Edit paths before running.
+- Venv at `.venv/`, activate with `source .venv/bin/activate`
+- `nixl` backend is optional — import gracefully falls back with a warning if not installed
+- Requires: Python 3.9+, GCC 11+, PyTorch, ninja
+
+### Running Benchmarks
+1. Create `.env` file in project root with your paths (gitignored):
+   ```
+   PROJ_DIR=/path/to/cpu_to_storage
+   STORAGE_PATH=/path/to/benchmark_tmp
+   CLUSTER_NAME=your_cluster
+   ```
+2. Create logs directory: `mkdir -p logs`
+3. Run: `./run_benchmark.sh short` (quick sanity check, ~2 min) or `./run_benchmark.sh full` (full benchmark, ~20 min)
+4. Monitor: `bjobs`, `bpeek <job_id>`
+5. Results: `logs/benchmark_<job_id>.out` and `results/` directory
+
+### LSF Quick Reference
+| Command | Purpose |
+|---------|---------|
+| `bjobs` | Check job status |
+| `bjobs -l <id>` | Detailed status / pending reason |
+| `bpeek <id>` | Live output of running job |
+| `bkill <id>` | Kill job (`bkill 0` kills all) |
+
+### Notes
+- `rusage[mem]` may cause scheduling failures on clusters with non-standard memory reporting — omit if jobs stay in PEND
+- The 50GB hardcoded cleaning buffer in `allocate_buffers()` requires machines with sufficient RAM (~160GB+ for a full 100GB buffer run)
 
 ---
 
