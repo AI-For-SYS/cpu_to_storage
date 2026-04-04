@@ -19,5 +19,8 @@
 - All writes use the atomic temp-file-then-rename pattern.
 - Results are JSON files saved incrementally with checkpoint/resume support.
 
+## Code Changes
+- Do not modify code without the user's explicit approval. Always show proposed changes first and wait for confirmation before applying.
+
 ## Git Commits
 - Do not add "Co-Authored-By" lines to commit messages.
