@@ -19,6 +19,11 @@
 - All writes use the atomic temp-file-then-rename pattern.
 - Results are JSON files saved incrementally with checkpoint/resume support.
 
+## Design Principles
+- Prefer well-separated, single-responsibility functions over monolithic code blocks — but only when each function encapsulates meaningful logic or a real strategy. Don't extract trivial one-liners into their own functions.
+- Separate strategy/policy from mechanism where the strategy could change independently (e.g., how files are opened vs. how I/O is submitted).
+- Structure code for future auto-tuning (Bayesian/Optuna) and code evolution (OpenEvolve): tunable parameters as individual setters, strategy logic in distinct functions that can be evolved or swapped independently.
+
 ## Code Changes
 - Do not modify code without the user's explicit approval. Always show proposed changes first and wait for confirmation before applying.
 

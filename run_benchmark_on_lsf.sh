@@ -1,6 +1,6 @@
 #!/bin/bash
-# Usage: ./run_benchmark.sh short   (quick sanity check)
-#        ./run_benchmark.sh full    (full benchmark, default)
+# Usage: ./run_benchmark_on_lsf.sh short   (quick sanity check)
+#        ./run_benchmark_on_lsf.sh full    (full benchmark, default)
 
 source "$(dirname "$0")/.env"
 

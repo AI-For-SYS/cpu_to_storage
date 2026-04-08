@@ -33,11 +33,14 @@ plotter.py                     Matplotlib visualization of results
 ```
 cpu_to_storage/
 ├── compare_file_operations.py     # Main CLI entry point
-├── setup.py                       # Builds C++ extension via PyTorch CppExtension
+├── setup.py                       # Builds C++ extension (cpp_ext) via PyTorch CppExtension
+├── setup_iouring.py               # Builds io_uring extension (iouring_ext), links liburing
 ├── plotter.py                     # Result visualization (multiple plot types)
 ├── copy_to_pod.sh                 # kubectl copy helper for K8s deployment
-├── setup_env.sh                   # CCC venv setup script
-├── run_benchmark.sh               # LSF job submission script
+├── setup_env.sh                   # Idempotent venv + deps + extensions setup (safe to re-run)
+├── run_benchmark_on_lsf.sh        # LSF job submission wrapper
+├── benchmark_job.sh               # Benchmark job script (called by run_benchmark_on_lsf.sh)
+├── .gitattributes                 # Forces LF line endings for all source files
 ├── .gitignore                     # Excludes sftp config, build artifacts
 ├── README.md                      # User-facing documentation
 ├── CLAUDE.md                      # Claude Code session instructions
@@ -45,13 +48,16 @@ cpu_to_storage/
 │
 ├── backends/
 │   ├── cpp_backend.py             # Thin async wrapper around cpp_ext module
+│   ├── iouring_backend.py         # Thin async wrapper around iouring_ext module
 │   ├── python_self_backend.py     # Pure Python: asyncio + ThreadPoolExecutor + os.readv/write
 │   ├── aiofiles_backend.py        # aiofiles library-based async I/O
 │   ├── nixl_backend.py            # NVIDIA NIXL with POSIX backend, memory registration
-│   └── benchmark_cpp_utils/
-│       ├── cpp_utils.cpp          # Core C++ I/O: pread/pwrite + thread pool dispatch
-│       ├── simple_thread_pool.cpp # Thread pool implementation (condition_variable based)
-│       └── simple_thread_pool.hpp # Thread pool header with template enqueue()
+│   ├── benchmark_cpp_utils/
+│   │   ├── cpp_utils.cpp          # Core C++ I/O: pread/pwrite + thread pool dispatch
+│   │   ├── simple_thread_pool.cpp # Thread pool implementation (condition_variable based)
+│   │   └── simple_thread_pool.hpp # Thread pool header with template enqueue()
+│   └── benchmark_iouring_utils/
+│       └── iouring_utils.cpp      # Core io_uring I/O: batched SQ/CQ submission
 │
 ├── utils/
 │   ├── benchmark_core.py          # Buffer allocation, benchmark iteration logic, executor setup
@@ -63,6 +69,8 @@ cpu_to_storage/
 │   ├── io_bench_pod.yaml          # K8s pod: 450Gi RAM, 12-128 CPU, 1 GPU, pytorch image
 │   └── io_bench_pvc.yaml          # K8s PVC: 300Gi ReadWriteMany
 │
+├── tests/
+│   └── test_iouring.py            # Quick smoke test for iouring_ext
 ├── results/                       # Benchmark output JSON files
 └── plots/                         # Generated matplotlib plots
 ```
@@ -118,6 +126,23 @@ cpu_to_storage/
 - **Read**: `aiofiles.open(rb)` + `f.readinto(memoryview_slice)`
 - **Write**: `aiofiles.open(wb)` + `f.write()`, then `aiofiles.os.replace()` for atomic rename
 - **Thread count**: Controlled by the executor set in `benchmark_core.setup_executor()`
+
+### io_uring Backend (`iouring_backend.py` + `benchmark_iouring_utils/`) — IN PROGRESS
+
+- **Platform**: Linux only, requires kernel 5.6+ with io_uring enabled (`kernel.io_uring_disabled = 0`)
+- **Build**: `python setup_iouring.py build_ext --inplace` (requires liburing at `$HOME/.local` or system-wide)
+- **Compiler flags**: `-std=c++17 -O3 -march=native -fPIC -luring`
+- **Concurrency model**: No thread pool — uses io_uring's submission/completion queue rings. Kernel handles I/O parallelism.
+- **Read strategy**: Opens FDs sequentially, batches pread SQEs into the submission queue, reaps completions from CQ
+- **Write strategy**: Serialized temp file creation (same O_CREAT pattern as cpp_ext), batches pwrite SQEs, then renames atomically
+- **Batch overflow**: When ops > queue_depth, submits in batches with interleaved completion reaping
+- **GIL**: Released via `py::gil_scoped_release` during all I/O operations
+- **Tunable parameters**: `queue_depth` (ring size), `batch_size` (SQEs per submit). Future: SQPOLL, O_DIRECT, registered files/buffers.
+- **Exposed functions**: `iouring_read_blocks()`, `iouring_write_blocks()`, `set_queue_depth()`, `set_batch_size()`
+- **Availability detection**: Runtime probe (`iouring_probe()`) at import time detects both missing extension (ImportError) and kernel-blocked io_uring (RuntimeError). Sets `IOURING_AVAILABLE = False` with warning.
+- **Status**: Code written, builds, and probe works. Not yet integrated into `benchmark_core.py` or `compare_file_operations.py` (step 5 in plan). Blocked on cluster io_uring access (`kernel.io_uring_disabled=2` on current LSF cluster). Needs a machine with sudo + kernel 5.6+ to enable io_uring.
+- **Design**: Modular strategy functions (`open_files_for_read/write`, `submit_io_ops`, `reap_completions`, `rename_temp_files`) structured for future Bayesian auto-tuning and OpenEvolve code evolution.
+- **Full plan**: See `docs/iouring_implementation_plan.md`
 
 ### NIXL Backend (`nixl_backend.py`)
 
@@ -228,10 +253,12 @@ Usage: `python plotter.py <mode> <file1> [file2] ...`
 ## LSF Remote Infrastructure
 
 ### Setup
-- `setup_env.sh` — one-time venv creation, dependency install, C++ extension build. Edit paths before running.
+- `setup_env.sh` — idempotent setup: venv creation (skipped if exists), dependency install, C++ extension build, liburing build (skipped if exists), io_uring extension build. Safe to re-run.
 - Venv at `.venv/`, activate with `source .venv/bin/activate`
 - `nixl` backend is optional — import gracefully falls back with a warning if not installed
+- `iouring` backend is optional — requires liburing and kernel with `io_uring_disabled=0`. Probes at import time and falls back with a warning if blocked.
 - Requires: Python 3.9+, GCC 11+, PyTorch, ninja
+- liburing built from source into `$HOME/.local` (shared across LSF nodes via shared home filesystem)
 
 ### Running Benchmarks
 1. Create `.env` file in project root with your paths (gitignored):
@@ -241,7 +268,9 @@ Usage: `python plotter.py <mode> <file1> [file2] ...`
    CLUSTER_NAME=your_cluster
    ```
 2. Create logs directory: `mkdir -p logs`
-3. Run: `./run_benchmark.sh short` (quick sanity check, ~2 min) or `./run_benchmark.sh full` (full benchmark, ~20 min)
+3. Run:
+   - `./run_benchmark_on_lsf.sh short` — sanity check: 2 block sizes (4,8 MB), 3 thread counts, 1 iteration, 10 blocks, cpp backend. ~2 min.
+   - `./run_benchmark_on_lsf.sh full` — full benchmark: 6 block sizes (2-64 MB), 3 thread counts, 5 iterations, 1000 blocks, cpp backend. ~15-20 min.
 4. Monitor: `bjobs`, `bpeek <job_id>`
 5. Results: `logs/benchmark_<job_id>.out` and `results/` directory
 
