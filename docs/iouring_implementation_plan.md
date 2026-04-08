@@ -204,15 +204,25 @@ full so the device never goes idle. This is one of the strategies OpenEvolve cou
 
 ## Python Wrapper Design (`iouring_backend.py`)
 
+The backend detects two failure modes at import time:
+- Extension not built (`ImportError`) — `iouring_ext.so` missing
+- Kernel blocks io_uring (`RuntimeError`) — `kernel.io_uring_disabled != 0`
+
+Both set `IOURING_AVAILABLE = False` with a warning message. Detection uses a lightweight
+`iouring_probe()` C++ function that tries `io_uring_queue_init()` + `io_uring_queue_exit()`.
+
 ```python
 import time
 
 IOURING_AVAILABLE = False
 try:
     import iouring_ext
+    iouring_ext.iouring_probe()
     IOURING_AVAILABLE = True
 except ImportError as e:
     print(f"Warning: io_uring extension not available: {e}")
+except RuntimeError as e:
+    print(f"Warning: io_uring blocked by kernel: {e}")
 
 # Individual parameter setters — one per tunable, for Optuna search space compatibility
 def set_queue_depth(depth):
@@ -291,16 +301,32 @@ io_uring manages its own concurrency (kernel-side), so like `cpp`, it returns `N
 
 ---
 
-## Implementation Order
+## Implementation Order & Status
 
-1. **Scaffold**: Create directory structure, empty files, build script
-2. **Read path**: Implement `iouring_read_blocks()` in C++ — simplest path, no file creation complexity
-3. **Build & smoke test**: Build on remote, test with small data on `/dev/shm`
-4. **Write path**: Implement `iouring_write_blocks()` with atomic temp-rename pattern
-5. **Integration**: Wire into `benchmark_core.py` and `compare_file_operations.py`
+1. ~~**Scaffold**: Create directory structure, empty files, build script~~ **DONE**
+2. ~~**Read path**: Implement `iouring_read_blocks()` in C++~~ **DONE**
+3. ~~**Build & smoke test**: Build on remote~~ **DONE** (builds OK, but io_uring blocked on cluster — see Blockers)
+4. ~~**Write path**: Implement `iouring_write_blocks()` with atomic temp-rename pattern~~ **DONE**
+5. **Integration**: Wire into `benchmark_core.py` and `compare_file_operations.py` — **NEXT**
 6. **Baseline comparison**: Run `iouring` vs `cpp` on `/dev/shm` with same parameters
 7. **Tuning knobs**: Add SQPOLL, O_DIRECT, registered files/buffers as toggleable options
 8. **Real storage test**: Run on actual filesystem (Spectrum Scale / NFS / whatever the cluster has)
+
+### Blockers
+
+- **io_uring disabled on LSF cluster**: `kernel.io_uring_disabled = 2` (fully disabled for all users).
+  Login nodes and compute nodes both block `io_uring_queue_init()` with `EPERM`.
+  Need a machine with sudo access to set `sysctl kernel.io_uring_disabled=0`.
+- **Machine requirements**: Linux kernel 5.6+, any NVIDIA GPU (for pin_memory), sudo, 64GB+ RAM, ideally local NVMe.
+
+### What's Ready to Resume
+
+- All C++ code written and compiles: `iouring_utils.cpp` with modular strategy functions
+- Python wrapper ready: `iouring_backend.py`
+- Build script ready: `setup_iouring.py` (auto-detects liburing at `$HOME/.local`)
+- liburing built and installed on LSF cluster at `$HOME/.local`
+- Smoke test script: `test_iouring.py` — run on a machine with io_uring enabled
+- Next step after successful smoke test: integrate into `benchmark_core.py` and `compare_file_operations.py`
 
 ---
 
