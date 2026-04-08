@@ -40,7 +40,6 @@ cpu_to_storage/
 ├── setup_env.sh                   # Idempotent venv + deps + extensions setup (safe to re-run)
 ├── run_benchmark_on_lsf.sh        # LSF job submission wrapper
 ├── benchmark_job.sh               # Benchmark job script (called by run_benchmark_on_lsf.sh)
-├── test_iouring.py                # Quick smoke test for iouring_ext (delete after use)
 ├── .gitattributes                 # Forces LF line endings for all source files
 ├── .gitignore                     # Excludes sftp config, build artifacts
 ├── README.md                      # User-facing documentation
@@ -70,6 +69,8 @@ cpu_to_storage/
 │   ├── io_bench_pod.yaml          # K8s pod: 450Gi RAM, 12-128 CPU, 1 GPU, pytorch image
 │   └── io_bench_pvc.yaml          # K8s PVC: 300Gi ReadWriteMany
 │
+├── tests/
+│   └── test_iouring.py            # Quick smoke test for iouring_ext
 ├── results/                       # Benchmark output JSON files
 └── plots/                         # Generated matplotlib plots
 ```

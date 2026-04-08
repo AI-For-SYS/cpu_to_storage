@@ -325,7 +325,7 @@ io_uring manages its own concurrency (kernel-side), so like `cpp`, it returns `N
 - Python wrapper ready: `iouring_backend.py`
 - Build script ready: `setup_iouring.py` (auto-detects liburing at `$HOME/.local`)
 - liburing built and installed on LSF cluster at `$HOME/.local`
-- Smoke test script: `test_iouring.py` — run on a machine with io_uring enabled
+- Smoke test script: `tests/test_iouring.py` — run on a machine with io_uring enabled
 - Next step after successful smoke test: integrate into `benchmark_core.py` and `compare_file_operations.py`
 
 ---
