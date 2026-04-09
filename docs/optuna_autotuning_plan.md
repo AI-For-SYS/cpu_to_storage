@@ -389,22 +389,40 @@ Same pattern as `cpp_backend.py` — thin async wrapper, plus a typed dataclass 
 
 ```python
 from dataclasses import dataclass, asdict
+from enum import Enum
+
+class FadviseHint(str, Enum):
+    NORMAL = "normal"
+    SEQUENTIAL = "sequential"
+    RANDOM = "random"
+    WILLNEED = "willneed"
+    NOREUSE = "noreuse"
+
+class SyncStrategy(str, Enum):
+    NONE = "none"
+    FDATASYNC = "fdatasync"
+    SYNC_FILE_RANGE = "sync_file_range"
 
 @dataclass
 class ThreadedTunableConfig:
-    thread_count: int = 0          # 0 = auto-detect (hardware_concurrency)
+    thread_count: int = 0
     o_noatime: bool = False
     o_direct: bool = False
-    fadvise_hint: str = "normal"   # normal, sequential, random, willneed, noreuse
-    io_chunk_kb: int = 0           # 0 = full block
-    prefetch_depth: int = 0        # 0 = disabled
+    fadvise_hint: FadviseHint = FadviseHint.NORMAL
+    io_chunk_kb: int = 0            # 0 = full block
+    prefetch_depth: int = 0         # 0 = disabled
     fallocate: bool = False
-    sync_strategy: str = "none"    # none, fdatasync, sync_file_range
+    sync_strategy: SyncStrategy = SyncStrategy.NONE
     cpu_affinity: bool = False
 
     def to_dict(self) -> dict:
-        return asdict(self)
+        d = asdict(self)
+        d["fadvise_hint"] = self.fadvise_hint.value
+        d["sync_strategy"] = self.sync_strategy.value
+        return d
 ```
+
+`FadviseHint` and `SyncStrategy` are `str, Enum` — type-safe with autocomplete, but serialize as plain strings via `to_dict()` so the C++ side receives the same string keys it expects.
 
 ### 4.2 Backend Functions
 
@@ -422,12 +440,14 @@ async def threaded_tunable_write_blocks(block_size, buffer, block_indices, dest_
     return time.perf_counter() - start
 
 def configure(config: ThreadedTunableConfig):
-    """Apply typed config to C++ backend."""
+    """Apply typed config to C++ backend. Single entry point for all parameters including thread count."""
     threaded_tunable_ext.configure_all(config.to_dict())
 
 def get_config() -> ThreadedTunableConfig:
-    """Read current C++ config back as a dataclass."""
-    return ThreadedTunableConfig(**threaded_tunable_ext.get_config())
+    """Read current C++ config back as a dataclass (with enum values)."""
+    raw = threaded_tunable_ext.get_config()
+    # Converts raw int/string values back to enums
+    return ThreadedTunableConfig(...)
 ```
 
 ---
@@ -479,7 +499,7 @@ def objective(trial: optuna.Trial, mode: str = "write") -> float:
     config = ThreadedTunableConfig(
         thread_count  = trial.suggest_int("thread_count", 4, 128, log=True),
         o_direct      = trial.suggest_categorical("o_direct", [True, False]),
-        fadvise_hint  = trial.suggest_categorical("fadvise_hint", ["normal", "sequential", "random", "noreuse"]),
+        fadvise_hint  = FadviseHint(trial.suggest_categorical("fadvise_hint", [e.value for e in FadviseHint])),
         io_chunk_kb   = trial.suggest_categorical("io_chunk_kb", [0, 256, 512, 1024, 2048, 4096]),
         cpu_affinity  = trial.suggest_categorical("cpu_affinity", [True, False]),
     )
@@ -493,7 +513,7 @@ def objective(trial: optuna.Trial, mode: str = "write") -> float:
     # Conditional: write-only params
     if mode in ("write", "concurrent"):
         config.fallocate      = trial.suggest_categorical("fallocate", [True, False])
-        config.sync_strategy  = trial.suggest_categorical("sync_strategy", ["none", "fdatasync", "sync_file_range"])
+        config.sync_strategy  = SyncStrategy(trial.suggest_categorical("sync_strategy", [e.value for e in SyncStrategy]))
 
     # 2. Apply typed config to C++ backend
     configure(config)
