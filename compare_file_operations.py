@@ -9,9 +9,10 @@ from utils.file_utils import generate_dest_file_names, clean_files, write_blocks
 from utils.benchmark_core import (
     create_benchmark_config, load_or_create_results, setup_executor, allocate_buffers,
     shutdown_executor, save_results, print_benchmark_summary, run_benchmark_iteration,
-    run_concurrent_benchmark_iteration, setup_cleaning_files
+    run_concurrent_benchmark_iteration, setup_cleaning_files, load_tunable_config
 )
 from backends.cpp_backend import CPP_AVAILABLE
+from backends.threaded_tunable_backend import THREADED_TUNABLE_AVAILABLE
 from utils.checkpoints_utils import save_incremental_results
 
 async def blocks_benchmark(num_blocks, iterations, buffer_size, implementation, test_name, block_sizes_mb, threads_counts, verify=False):
@@ -20,6 +21,10 @@ async def blocks_benchmark(num_blocks, iterations, buffer_size, implementation, 
     if implementation=="cpp":
         if not CPP_AVAILABLE:
             print("cpp implementation not available.")
+            return
+    if implementation=="threaded_tunable":
+        if not THREADED_TUNABLE_AVAILABLE:
+            print("threaded_tunable implementation not available.")
             return
 
     diff = block_sizes_mb[-1]*num_blocks - buffer_size/(1024*1024)
@@ -121,6 +126,10 @@ async def total_data_benchmark(total_gb, iterations, buffer_size, implementation
     if implementation=="cpp":
         if not CPP_AVAILABLE:
             print("cpp implementation not available.")
+            return
+    if implementation=="threaded_tunable":
+        if not THREADED_TUNABLE_AVAILABLE:
+            print("threaded_tunable implementation not available.")
             return
 
     total_combinations = len(block_sizes_mb) * len(threads_counts)
@@ -230,6 +239,10 @@ async def concurrent_benchmark(total_gb, iterations, buffer_size, implementation
     if implementation=="cpp":
         if not CPP_AVAILABLE:
             print("cpp implementation not available.")
+            return
+    if implementation=="threaded_tunable":
+        if not THREADED_TUNABLE_AVAILABLE:
+            print("threaded_tunable implementation not available.")
             return
 
     total_combinations = len(block_sizes_mb) * len(threads_counts)
@@ -384,9 +397,15 @@ if __name__ == "__main__":
     parser.add_argument(
         '--backend',
         type=str,
-        choices=['cpp', 'python_aiofiles', 'python_self_imp', 'nixl'],
+        choices=['cpp', 'python_aiofiles', 'python_self_imp', 'nixl', 'threaded_tunable'],
         default='python_self_imp',
         help='I/O backend to benchmark (default: python_self_imp)'
+    )
+    parser.add_argument(
+        '--tunable-config',
+        type=str,
+        default=None,
+        help='Path to JSON config for threaded_tunable backend (e.g., results/best_write_config.json)'
     )
     parser.add_argument(
         '--buffer-size',
@@ -446,6 +465,13 @@ if __name__ == "__main__":
     except Exception as e:
         print(f"Warning: Cleanup failed: {e}\n")
     
+    # Load tunable config if provided
+    if args.tunable_config:
+        if args.backend != "threaded_tunable":
+            print("Warning: --tunable-config is only used with --backend threaded_tunable, ignoring")
+        else:
+            load_tunable_config(args.tunable_config)
+
     # Convert buffer size from GB to bytes
     buffer_size = args.buffer_size * 1024 * 1024 * 1024
     threads_counts = [16, 32, 64]
@@ -462,6 +488,8 @@ if __name__ == "__main__":
     print(f"Cluster:         {CLUSTER}")
     print(f"Test_name:       {args.test_name}")
     print(f"Verify:          {args.verify}")
+    if args.tunable_config and args.backend == "threaded_tunable":
+        print(f"Tunable Config:  {args.tunable_config}")
 
     if args.mode == 'blocks':
         print(f"Num Blocks:      {args.num_blocks}")

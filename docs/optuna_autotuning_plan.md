@@ -420,9 +420,39 @@ class ThreadedTunableConfig:
         d["fadvise_hint"] = self.fadvise_hint.value
         d["sync_strategy"] = self.sync_strategy.value
         return d
+
+    def save(self, path: str):
+        """Save config to JSON file (e.g., results/best_write_config.json)."""
+        import json
+        with open(path, 'w') as f:
+            json.dump(self.to_dict(), f, indent=2)
+
+    @classmethod
+    def load(cls, path: str) -> "ThreadedTunableConfig":
+        """Load config from JSON file, converting strings back to enums."""
+        import json
+        with open(path) as f:
+            d = json.load(f)
+        return cls(
+            thread_count=d.get("thread_count", 0),
+            o_noatime=d.get("o_noatime", False),
+            o_direct=d.get("o_direct", False),
+            fadvise_hint=FadviseHint(d.get("fadvise_hint", "normal")),
+            io_chunk_kb=d.get("io_chunk_kb", 0),
+            prefetch_depth=d.get("prefetch_depth", 0),
+            fallocate=d.get("fallocate", False),
+            sync_strategy=SyncStrategy(d.get("sync_strategy", "none")),
+            cpu_affinity=d.get("cpu_affinity", False),
+        )
 ```
 
 `FadviseHint` and `SyncStrategy` are `str, Enum` — type-safe with autocomplete, but serialize as plain strings via `to_dict()` so the C++ side receives the same string keys it expects.
+
+**Config file location**: `results/best_{mode}_config.json` — same directory as benchmark results, distinguished by naming.
+
+**Flow**:
+- `optuna_tuner.py` calls `best_config.save("results/best_write_config.json")` after study completes
+- `compare_file_operations.py --tunable-config results/best_write_config.json` calls `ThreadedTunableConfig.load(path)` then `configure(config)` before benchmarking
 
 ### 4.2 Backend Functions
 
@@ -740,12 +770,14 @@ Results saved per-backend: results/data_*_cpp.json, results/data_*_threaded_tuna
 Plot: python plotter.py data results/*.json
 ```
 
-### 8.3 Exported Best Config
+### 8.3 Exported Best Config (`results/best_{mode}_config.json`)
+
+Saved by `optuna_tuner.py` via `ThreadedTunableConfig.save()`. The file contains the tunable parameters (loadable by `ThreadedTunableConfig.load()`) plus metadata added by the tuner:
 
 ```json
 {
   "thread_count": 48,
-  "block_size_mb": 32,
+  "o_noatime": true,
   "o_direct": false,
   "fadvise_hint": "sequential",
   "io_chunk_kb": 2048,
@@ -753,14 +785,18 @@ Plot: python plotter.py data results/*.json
   "fallocate": true,
   "sync_strategy": "none",
   "cpu_affinity": false,
-  "measured_write_throughput_gbs": 12.4,
-  "measured_read_throughput_gbs": 18.7,
-  "storage_path": "/mnt/storage",
-  "study_name": "threaded_tunable_write_tuning",
-  "trial_number": 142,
-  "total_trials": 200
+  "_metadata": {
+    "study_name": "threaded_tunable_write_tuning",
+    "trial_number": 142,
+    "total_trials": 200,
+    "measured_throughput_gbs": 12.4,
+    "storage_path": "/mnt/storage",
+    "block_size_mb": 32
+  }
 }
 ```
+
+`ThreadedTunableConfig.load()` ignores the `_metadata` key (only reads known fields via `.get()`). The metadata is informational — tells you which study produced this config and what throughput was measured.
 
 ### 8.4 Workflow Examples
 

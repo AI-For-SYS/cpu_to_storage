@@ -15,8 +15,33 @@ try:
 except ImportError:
     NIXL_AVAILABLE = False
     print("Warning: nixl backend not available (nixl package not installed). Skipping nixl support.")
+try:
+    from backends.threaded_tunable_backend import (
+        threaded_tunable_write_blocks, threaded_tunable_read_blocks,
+        configure as threaded_tunable_configure, THREADED_TUNABLE_AVAILABLE
+    )
+except ImportError:
+    THREADED_TUNABLE_AVAILABLE = False
+    print("Warning: threaded_tunable backend not available. Run 'python setup_threaded_tunable.py build_ext --inplace' to build it.")
 from utils.file_utils import verify_op
 import time
+
+# Holds the loaded ThreadedTunableConfig (set by load_tunable_config, used by setup_executor)
+_tunable_config = None
+
+def load_tunable_config(config_path):
+    """Load a ThreadedTunableConfig from JSON and store it for use during benchmarking."""
+    global _tunable_config
+    from backends.threaded_tunable_backend import ThreadedTunableConfig
+    _tunable_config = ThreadedTunableConfig.load(config_path)
+    print(f"Loaded tunable config from {config_path}: {_tunable_config}")
+
+def init_default_tunable_config():
+    """Initialize with default tunable config if none was loaded."""
+    global _tunable_config
+    if _tunable_config is None:
+        from backends.threaded_tunable_backend import ThreadedTunableConfig
+        _tunable_config = ThreadedTunableConfig()
 
 def create_benchmark_config(buffer_size, iterations, threads_counts, block_sizes_mb, implementation, **kwargs):
     """Create configuration dictionary for benchmark."""
@@ -64,6 +89,12 @@ def setup_executor(implementation, num_threads):
     """Setup thread pool executor for the given implementation."""
     if implementation == "cpp":
         set_thread_count_cpp(num_threads)
+        return None
+    elif implementation == "threaded_tunable":
+        from backends.threaded_tunable_backend import configure
+        init_default_tunable_config()
+        _tunable_config.thread_count = num_threads
+        configure(_tunable_config)
         return None
     else:
         loop = asyncio.get_running_loop()
@@ -115,15 +146,26 @@ async def run_benchmark_iteration(
     if implementation == "cpp":
         time_write = await cpp_write_blocks(block_size, buffer, blocks_indices_write, file_names)
         verify_op(block_size, blocks_indices_write, view, file_names, "Writing", verify)
-        
+
         # reading 100GB of other blocks to clean the cache
         await cpp_read_blocks(block_size_cleaning, buffer_cleaning, indices_cleaning, file_names_cleaning)
 
         time_read = await cpp_read_blocks(block_size, buffer, blocks_indices_read, file_names)
         verify_op(block_size, blocks_indices_read, view, file_names, "Reading", verify)
-        
+
         # reading 100GB of other blocks to clean the cache
         await cpp_read_blocks(block_size_cleaning, buffer_cleaning, indices_cleaning, file_names_cleaning)
+
+    elif implementation == "threaded_tunable":
+        time_write = await threaded_tunable_write_blocks(block_size, buffer, blocks_indices_write, file_names)
+        verify_op(block_size, blocks_indices_write, view, file_names, "Writing", verify)
+
+        await threaded_tunable_read_blocks(block_size_cleaning, buffer_cleaning, indices_cleaning, file_names_cleaning)
+
+        time_read = await threaded_tunable_read_blocks(block_size, buffer, blocks_indices_read, file_names)
+        verify_op(block_size, blocks_indices_read, view, file_names, "Reading", verify)
+
+        await threaded_tunable_read_blocks(block_size_cleaning, buffer_cleaning, indices_cleaning, file_names_cleaning)
 
     elif implementation == "python_aiofiles":
         time_write = await aiofiles_write_blocks(block_size, view, blocks_indices_write, file_names)
@@ -185,6 +227,8 @@ async def run_concurrent_benchmark_iteration(
     # Clean cache before concurrent operations
     if implementation == "cpp":
         await cpp_read_blocks(block_size_cleaning, buffer_cleaning, indices_cleaning, file_names_cleaning)
+    elif implementation == "threaded_tunable":
+        await threaded_tunable_read_blocks(block_size_cleaning, buffer_cleaning, indices_cleaning, file_names_cleaning)
     elif implementation == "nixl":
         reg_handler_cleaning = nixl_register_buffer(_get_read_agent(), buffer_cleaning)
         nixl_read_blocks(block_size_cleaning, buffer_cleaning, indices_cleaning, file_names_cleaning)
@@ -194,13 +238,18 @@ async def run_concurrent_benchmark_iteration(
 
     # Run concurrent read and write operations
     start_time = time.perf_counter()
-    
+
     if implementation == "cpp":
         # Run both operations concurrently
         write_task = cpp_write_blocks(block_size, buffer, blocks_indices_write, file_names_write)
         read_task = cpp_read_blocks(block_size, buffer, blocks_indices_read, file_names_read)
         time_write, time_read = await asyncio.gather(write_task, read_task)
-        
+
+    elif implementation == "threaded_tunable":
+        write_task = threaded_tunable_write_blocks(block_size, buffer, blocks_indices_write, file_names_write)
+        read_task = threaded_tunable_read_blocks(block_size, buffer, blocks_indices_read, file_names_read)
+        time_write, time_read = await asyncio.gather(write_task, read_task)
+
     elif implementation == "python_aiofiles":
         write_task = aiofiles_write_blocks(block_size, view, blocks_indices_write, file_names_write)
         read_task = aiofiles_read_blocks(block_size, view, blocks_indices_read, file_names_read)
@@ -233,6 +282,8 @@ async def run_concurrent_benchmark_iteration(
     # Clean cache after concurrent operations
     if implementation == "cpp":
         await cpp_read_blocks(block_size_cleaning, buffer_cleaning, indices_cleaning, file_names_cleaning)
+    elif implementation == "threaded_tunable":
+        await threaded_tunable_read_blocks(block_size_cleaning, buffer_cleaning, indices_cleaning, file_names_cleaning)
     elif implementation == "nixl":
         reg_handler_cleaning = nixl_register_buffer(_get_read_agent(), buffer_cleaning)
         nixl_read_blocks(block_size_cleaning, buffer_cleaning, indices_cleaning, file_names_cleaning)

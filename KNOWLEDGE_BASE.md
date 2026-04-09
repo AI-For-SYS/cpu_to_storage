@@ -41,6 +41,7 @@ plotter.py                     Matplotlib visualization of results
 cpu_to_storage/
 ├── compare_file_operations.py     # Main CLI entry point
 ├── setup.py                       # Builds C++ extension (cpp_ext) via PyTorch CppExtension
+├── setup_threaded_tunable.py      # Builds threaded_tunable extension (threaded_tunable_ext)
 ├── setup_iouring.py               # Builds io_uring extension (iouring_ext), links liburing
 ├── plotter.py                     # Result visualization (multiple plot types)
 ├── copy_to_pod.sh                 # kubectl copy helper for K8s deployment
@@ -55,14 +56,16 @@ cpu_to_storage/
 │
 ├── backends/
 │   ├── cpp_backend.py             # Thin async wrapper around cpp_ext module
+│   ├── threaded_tunable_backend.py # Tunable wrapper + ThreadedTunableConfig dataclass + save/load
 │   ├── iouring_backend.py         # Thin async wrapper around iouring_ext module
 │   ├── python_self_backend.py     # Pure Python: asyncio + ThreadPoolExecutor + os.readv/write
 │   ├── aiofiles_backend.py        # aiofiles library-based async I/O
 │   ├── nixl_backend.py            # NVIDIA NIXL with POSIX backend, memory registration
 │   ├── benchmark_cpp_utils/
-│   │   ├── cpp_utils.cpp          # Core C++ I/O: pread/pwrite + thread pool dispatch
-│   │   ├── simple_thread_pool.cpp # Thread pool implementation (condition_variable based)
-│   │   └── simple_thread_pool.hpp # Thread pool header with template enqueue()
+│   │   ├── cpp_utils.cpp              # Core C++ I/O: pread/pwrite + thread pool dispatch
+│   │   ├── threaded_tunable_utils.cpp # Tunable C++ I/O: same core + IOConfig parameters
+│   │   ├── simple_thread_pool.cpp     # Thread pool implementation (shared by cpp and tunable)
+│   │   └── simple_thread_pool.hpp     # Thread pool header with template enqueue()
 │   └── benchmark_iouring_utils/
 │       └── iouring_utils.cpp      # Core io_uring I/O: batched SQ/CQ submission
 │
@@ -77,8 +80,12 @@ cpu_to_storage/
 │   └── io_bench_pvc.yaml          # K8s PVC: 300Gi ReadWriteMany
 │
 ├── tests/
-│   └── test_iouring.py            # Quick smoke test for iouring_ext
-├── results/                       # Benchmark output JSON files
+│   ├── test_iouring.py            # Quick smoke test for iouring_ext
+│   └── test_threaded_tunable.py   # Smoke test: build, config roundtrip, each knob, baseline comparison
+├── docs/
+│   ├── optuna_autotuning_plan.md  # Design plan for Optuna + threaded_tunable
+│   └── ...                        # Presentation files
+├── results/                       # Benchmark output JSON files + tunable config JSONs
 └── plots/                         # Generated matplotlib plots
 ```
 
@@ -117,6 +124,22 @@ cpu_to_storage/
 - **GIL**: Released via `py::gil_scoped_release` during all I/O operations
 - **Thread count**: Configurable at runtime via `set_thread_count()`, recreates the pool
 - **Exposed functions**: `cpp_read_blocks()`, `cpp_write_blocks()`, `set_thread_count()`, `get_io_thread_count()`
+
+### Threaded Tunable Backend (`threaded_tunable_backend.py` + `benchmark_cpp_utils/`)
+
+- **Platform**: Linux only (same POSIX APIs as cpp backend)
+- **Build**: `python setup_threaded_tunable.py build_ext --inplace`
+- **Purpose**: Same pread/pwrite thread pool as baseline `cpp`, with tunable I/O parameters for Optuna auto-optimization
+- **Core I/O**: Identical to `cpp` — pread/pwrite in thread pool, sequential temp-file creation for writes, parallel opens for reads, atomic rename
+- **Configuration**: `IOConfig` struct with 9 tunable parameters, `configure_all(dict)` bulk setter, `get_config()` getter
+- **Tunable parameters**: `O_NOATIME`, `O_DIRECT`, `posix_fadvise` hints, `io_chunk_size`, `prefetch_depth` (readahead), `fallocate` pre-allocation, `sync_strategy` (none/fdatasync/sync_file_range), `cpu_affinity`
+- **Python config**: `ThreadedTunableConfig` dataclass with `FadviseHint`/`SyncStrategy` enums, `save()`/`load()` for JSON persistence to `results/`
+- **Config loading**: `compare_file_operations.py --tunable-config results/best_write_config.json` loads saved params before benchmarking
+- **Default behavior**: With all parameters at defaults, behaves identically to baseline `cpp`
+- **GIL**: Released via `py::gil_scoped_release` during all I/O operations
+- **Exposed functions**: `threaded_tunable_read_blocks()`, `threaded_tunable_write_blocks()`, `configure_all()`, `get_config()`, individual setters
+- **Smoke test**: `python -m tests.test_threaded_tunable` — verifies build, config roundtrip, data integrity, each parameter individually
+- **Design doc**: `docs/optuna_autotuning_plan.md`
 
 ### Python Self-Implementation (`python_self_backend.py`)
 
@@ -208,7 +231,8 @@ cpu_to_storage/
 | Argument | Default | Description |
 |----------|---------|-------------|
 | `--mode` | `blocks` | `blocks`, `data`, or `concurrent` |
-| `--backend` | `python_self_imp` | `cpp`, `python_aiofiles`, `python_self_imp`, `nixl` |
+| `--backend` | `python_self_imp` | `cpp`, `threaded_tunable`, `python_aiofiles`, `python_self_imp`, `nixl` |
+| `--tunable-config` | `None` | Path to JSON config for `threaded_tunable` backend |
 | `--buffer-size` | `100` | Buffer size in GB |
 | `--iterations` | `5` | Iterations per (thread_count, block_size) combination |
 | `--num-blocks` | `1000` | Blocks to transfer (blocks mode only) |
@@ -260,7 +284,7 @@ Usage: `python plotter.py <mode> <file1> [file2] ...`
 ## LSF Remote Infrastructure
 
 ### Setup
-- `setup_env.sh` — idempotent setup: venv creation (skipped if exists), dependency install, C++ extension build, liburing build (skipped if exists), io_uring extension build. Safe to re-run.
+- `setup_env.sh` — idempotent setup: venv creation (skipped if exists), dependency install, C++ extension build, threaded_tunable extension build, liburing build (skipped if exists), io_uring extension build. Safe to re-run.
 - Venv at `.venv/`, activate with `source .venv/bin/activate`
 - `nixl` backend is optional — import gracefully falls back with a warning if not installed
 - `iouring` backend is optional — requires liburing and kernel with `io_uring_disabled=0`. Probes at import time and falls back with a warning if blocked.
@@ -278,6 +302,10 @@ Usage: `python plotter.py <mode> <file1> [file2] ...`
 3. Run:
    - `./run_benchmark_on_lsf.sh short` — sanity check: 2 block sizes (4,8 MB), 3 thread counts, 1 iteration, 10 blocks, cpp backend. ~2 min.
    - `./run_benchmark_on_lsf.sh full` — full benchmark: 6 block sizes (2-64 MB), 3 thread counts, 5 iterations, 1000 blocks, cpp backend. ~15-20 min.
+   - `./run_benchmark_on_lsf.sh short threaded_tunable` — run single backend.
+   - `./run_benchmark_on_lsf.sh compare-short` — run all backends on same node for fair comparison (short).
+   - `./run_benchmark_on_lsf.sh compare-short "cpp threaded_tunable"` — compare selected backends only.
+   - `./run_benchmark_on_lsf.sh compare-full "cpp threaded_tunable" results/best_write_config.json` — full comparison with tunable config.
 4. Monitor: `bjobs`, `bpeek <job_id>`
 5. Results: `logs/benchmark_<job_id>.out` and `results/` directory
 

@@ -1,3 +1,4 @@
+import json
 import time
 from dataclasses import dataclass, asdict
 from enum import Enum
@@ -42,6 +43,31 @@ class ThreadedTunableConfig:
         d["fadvise_hint"] = self.fadvise_hint.value
         d["sync_strategy"] = self.sync_strategy.value
         return d
+
+    def save(self, path: str, metadata: dict = None):
+        """Save config to JSON file (e.g., results/best_write_config.json)."""
+        d = self.to_dict()
+        if metadata:
+            d["_metadata"] = metadata
+        with open(path, 'w') as f:
+            json.dump(d, f, indent=2)
+
+    @classmethod
+    def load(cls, path: str) -> "ThreadedTunableConfig":
+        """Load config from JSON file, converting strings back to enums."""
+        with open(path) as f:
+            d = json.load(f)
+        return cls(
+            thread_count=d.get("thread_count", 0),
+            o_noatime=d.get("o_noatime", False),
+            o_direct=d.get("o_direct", False),
+            fadvise_hint=FadviseHint(d.get("fadvise_hint", "normal")),
+            io_chunk_kb=d.get("io_chunk_kb", 0),
+            prefetch_depth=d.get("prefetch_depth", 0),
+            fallocate=d.get("fallocate", False),
+            sync_strategy=SyncStrategy(d.get("sync_strategy", "none")),
+            cpu_affinity=d.get("cpu_affinity", False),
+        )
 
 
 def configure(config: ThreadedTunableConfig):
