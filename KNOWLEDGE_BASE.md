@@ -2,7 +2,14 @@
 
 ## Project Purpose
 
-A high-performance benchmarking suite that measures and compares file I/O throughput (read/write) across multiple implementation backends. Designed for evaluating parallel I/O strategies relevant to ML model checkpointing and large-scale data pipelines. The goal is to find the fastest way to move data between CPU memory and storage.
+A high-performance benchmarking suite for **KV cache offload**: moving KV cache layers between CPU memory (pinned `torch.Tensor`, float16) and storage, and reloading them back. This is not a general-purpose I/O benchmark — it specifically models the ML inference pattern where:
+
+- **Write (offload)**: KV cache layers are evicted from CPU memory to storage in parallel (multiple layers/shards concurrently). Data originates from live tensors, not from prior disk reads.
+- **Read (reload)**: KV cache layers are loaded back from storage into CPU tensors. Data is read once per reload — no random re-reads, no caching benefit.
+- **Parallelism**: Multiple threads handle different files (layers/shards) concurrently. No parameter or I/O strategy may restrict parallel access.
+- **Durability**: Optional. If the system crashes, KV cache can be recomputed from the model. Sync-to-disk is only needed for durable checkpointing, not for temporary offload.
+
+The suite compares file I/O throughput (read/write) across multiple implementation backends to find the fastest offload/reload strategy. Also relevant to ML model checkpointing and large-scale data pipelines.
 
 ---
 
