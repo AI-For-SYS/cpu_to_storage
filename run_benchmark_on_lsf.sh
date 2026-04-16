@@ -1,11 +1,11 @@
 #!/bin/bash
-# Usage: ./run_benchmark_on_lsf.sh short                                          (quick sanity, cpp backend)
-#        ./run_benchmark_on_lsf.sh full                                           (full benchmark, cpp backend)
+# Usage: ./run_benchmark_on_lsf.sh short                                          (quick sanity, cpp backend, blocks mode)
+#        ./run_benchmark_on_lsf.sh full                                           (full benchmark, cpp backend, blocks mode)
 #        ./run_benchmark_on_lsf.sh short threaded_tunable                          (quick sanity, tunable backend)
 #        ./run_benchmark_on_lsf.sh full threaded_tunable config.json               (full, tunable with config)
-#        ./run_benchmark_on_lsf.sh compare-short                                   (all backends, same node, short)
-#        ./run_benchmark_on_lsf.sh compare-short "cpp threaded_tunable"            (selected backends, short)
-#        ./run_benchmark_on_lsf.sh compare-full "cpp threaded_tunable" config.json (selected backends, full, with config)
+#        ./run_benchmark_on_lsf.sh compare-short                                   (all backends, same node, data mode)
+#        ./run_benchmark_on_lsf.sh compare-short "cpp threaded_tunable"            (selected backends, data mode)
+#        ./run_benchmark_on_lsf.sh compare-full "cpp threaded_tunable" config.json (selected backends, data mode, with config)
 
 source "$(dirname "$0")/.env"
 

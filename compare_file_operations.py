@@ -3,13 +3,15 @@ import time
 import statistics
 import random
 import argparse
+from datetime import datetime
 
 from utils.config import STORAGE_PATH, CLUSTER
 from utils.file_utils import generate_dest_file_names, clean_files, write_blocks
 from utils.benchmark_core import (
     create_benchmark_config, load_or_create_results, setup_executor, allocate_buffers,
-    shutdown_executor, save_results, print_benchmark_summary, run_benchmark_iteration,
-    run_concurrent_benchmark_iteration, setup_cleaning_files, load_tunable_config
+    shutdown_executor, print_benchmark_summary, run_benchmark_iteration,
+    run_concurrent_benchmark_iteration, setup_cleaning_files, load_tunable_config,
+    get_tunable_config
 )
 from backends.cpp_backend import CPP_AVAILABLE
 from backends.threaded_tunable_backend import THREADED_TUNABLE_AVAILABLE
@@ -37,7 +39,8 @@ async def blocks_benchmark(num_blocks, iterations, buffer_size, implementation, 
     
     dest = "tmpfs" if STORAGE_PATH== "/dev/shm" else "storage"
 
-    output_file = f'results/blocks_{num_blocks}_{test_name}_{dest}_{implementation}.json'
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    output_file = f'results/blocks_{num_blocks}_{test_name}_{dest}_{implementation}_{ts}.json'
     
     config = create_benchmark_config(
         buffer_size, iterations, threads_counts, block_sizes_mb, implementation,
@@ -102,21 +105,35 @@ async def blocks_benchmark(num_blocks, iterations, buffer_size, implementation, 
             
             write_throughput = block_size_mb*num_blocks / (avg_write*1024)
             read_throughput = block_size_mb*num_blocks / (avg_read*1024)
-            
+
             print(f"    Write: {avg_write*1000:.2f}ms ({write_throughput:.2f} GB/s)")
             print(f"    Read:  {avg_read*1000:.2f}ms ({read_throughput:.2f} GB/s)")
-            
-            # Save results incrementally after each test
-            save_results(output_file, config, write_results, read_results)
+
+            # Save results incrementally with throughput
+            write_tp = {}
+            read_tp = {}
+            for tc in write_results:
+                write_tp[tc] = {bs: int(bs) * num_blocks / (t * 1024)
+                                for bs, t in write_results[tc].items()}
+            for tc in read_results:
+                read_tp[tc] = {bs: int(bs) * num_blocks / (t * 1024)
+                               for bs, t in read_results[tc].items()}
+            all_results = {
+                'config': config,
+                'write': write_results, 'write_throughput_gbs': write_tp,
+                'read': read_results, 'read_throughput_gbs': read_tp,
+            }
+            save_incremental_results(output_file, all_results)
             print(f"    Results saved to {output_file}")
-        
+
         shutdown_executor(implementation, executor)
-            
-    all_results = save_results(output_file, config, write_results, read_results)
-    
+
+    clean_files(file_names)
+    clean_files(file_names_cleaning)
+
     total_time = time.perf_counter() - start_time
     print_benchmark_summary(total_time, output_file)
-    
+
     return all_results
 
 
@@ -138,7 +155,8 @@ async def total_data_benchmark(total_gb, iterations, buffer_size, implementation
 
     dest = "tmpfs" if STORAGE_PATH== "/dev/shm" else "storage"
     
-    output_file = f'results/data_{test_name}_{total_gb}gb_{dest}_{implementation}.json'
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    output_file = f'results/data_{test_name}_{total_gb}gb_{dest}_{implementation}_{ts}.json'
     
     config = create_benchmark_config(
         buffer_size, iterations, threads_counts, block_sizes_mb, implementation,
@@ -206,21 +224,32 @@ async def total_data_benchmark(total_gb, iterations, buffer_size, implementation
             
             write_throughput = total_gb / avg_write
             read_throughput = total_gb / avg_read
-            
+
             print(f"    Write: {avg_write*1000:.2f}ms ({write_throughput:.2f} GB/s)")
             print(f"    Read:  {avg_read*1000:.2f}ms ({read_throughput:.2f} GB/s)")
-            
-            # Save results incrementally after each test
-            save_results(output_file, config, write_results, read_results)
+
+            # Save results incrementally with throughput
+            write_tp = {}
+            read_tp = {}
+            for tc in write_results:
+                write_tp[tc] = {bs: total_gb / t for bs, t in write_results[tc].items()}
+            for tc in read_results:
+                read_tp[tc] = {bs: total_gb / t for bs, t in read_results[tc].items()}
+            all_results = {
+                'config': config,
+                'write': write_results, 'write_throughput_gbs': write_tp,
+                'read': read_results, 'read_throughput_gbs': read_tp,
+            }
+            save_incremental_results(output_file, all_results)
             print(f"    Results saved to {output_file}")
-        
+
         shutdown_executor(implementation, executor)
-    
-    all_results = save_results(output_file, config, write_results, read_results)
+
+    clean_files(file_names)
     clean_files(file_names_cleaning)
     total_time = time.perf_counter() - start_time
     print_benchmark_summary(total_time, output_file)
-    
+
     return all_results
 
 
@@ -250,7 +279,8 @@ async def concurrent_benchmark(total_gb, iterations, buffer_size, implementation
     print(f"Total data size: {total_gb} GB split between read ({total_gb/2} GB) and write ({total_gb/2} GB)")
     
     dest = "tmpfs" if STORAGE_PATH== "/dev/shm" else "storage"
-    output_file = f'results/concurrent_{test_name}_{total_gb}gb_{dest}_{implementation}.json'
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    output_file = f'results/concurrent_{test_name}_{total_gb}gb_{dest}_{implementation}_{ts}.json'
     
     config = create_benchmark_config(
         buffer_size, iterations, threads_counts, block_sizes_mb, implementation,
@@ -353,31 +383,281 @@ async def concurrent_benchmark(total_gb, iterations, buffer_size, implementation
             # Clean up read files after all iterations for this block size are complete
             clean_files(file_names_read)
             
-            # Save results incrementally after each test
+            # Save results incrementally with throughput
+            half_gb = total_gb / 2
+            write_tp = {}
+            read_tp = {}
+            concurrent_tp = {}
+            for tc in write_results:
+                write_tp[tc] = {bs: half_gb / t for bs, t in write_results[tc].items()}
+            for tc in read_results:
+                read_tp[tc] = {bs: half_gb / t for bs, t in read_results[tc].items()}
+            for tc in concurrent_results:
+                concurrent_tp[tc] = {bs: total_gb / t for bs, t in concurrent_results[tc].items()}
             all_results = {
                 'config': config,
-                'write': write_results,
-                'read': read_results,
-                'concurrent': concurrent_results
+                'write': write_results, 'write_throughput_gbs': write_tp,
+                'read': read_results, 'read_throughput_gbs': read_tp,
+                'concurrent': concurrent_results, 'concurrent_throughput_gbs': concurrent_tp,
             }
-            save_results(output_file, config, write_results, read_results)
+            save_incremental_results(output_file, all_results)
             print(f"    Results saved to {output_file}")
-        
+
         shutdown_executor(implementation, executor)
-    
-    # Final save with all three result types
+
+    clean_files(file_names_cleaning)
+
+    total_time = time.perf_counter() - start_time
+    print_benchmark_summary(total_time, output_file)
+
+    return all_results
+
+
+async def tunable_benchmark(num_blocks, iterations, buffer_size, test_name, total_gb=None, verify=False):
+    """Benchmark threaded_tunable with separate best configs for write, read, and concurrent.
+
+    Runs three passes:
+    1. Write pass with write config
+    2. Read pass with read config
+    3. Concurrent pass with concurrent config (simultaneous write + read)
+
+    Args:
+        num_blocks: Fixed number of blocks per pass (blocks mode).
+                    Ignored if total_gb is set.
+        total_gb: Fixed total data in GB (data mode).
+                  When set, num_blocks is calculated per pass from total_gb / block_size_mb.
+    """
+    from utils.benchmark_core import (
+        run_tunable_write, run_tunable_read, get_tunable_config,
+        threaded_tunable_configure
+    )
+    from backends.threaded_tunable_backend import (
+        threaded_tunable_write_blocks, threaded_tunable_read_blocks
+    )
+
+    start_time = time.perf_counter()
+
+    if not THREADED_TUNABLE_AVAILABLE:
+        print("threaded_tunable implementation not available.")
+        return
+
+    write_cfg = get_tunable_config("write")
+    read_cfg = get_tunable_config("read")
+    write_block_mb = write_cfg.block_size_mb or 32
+    read_block_mb = read_cfg.block_size_mb or 8
+
+    dest = "tmpfs" if STORAGE_PATH == "/dev/shm" else "storage"
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+
+    if total_gb is not None:
+        output_file = f'results/data_{test_name}_{total_gb}gb_{dest}_threaded_tunable_{ts}.json'
+    else:
+        output_file = f'results/blocks_{num_blocks}_{test_name}_{dest}_threaded_tunable_{ts}.json'
+
+    # Calculate num_blocks per pass
+    write_block_size = write_block_mb * 1024 * 1024
+    read_block_size = read_block_mb * 1024 * 1024
+    max_write_blocks = buffer_size // write_block_size
+    max_read_blocks = buffer_size // read_block_size
+
+    if total_gb is not None:
+        write_num_blocks = min(int((total_gb * 1024) / write_block_mb), max_write_blocks)
+        read_num_blocks = min(int((total_gb * 1024) / read_block_mb), max_read_blocks)
+    else:
+        write_num_blocks = min(num_blocks, max_write_blocks)
+        read_num_blocks = min(num_blocks, max_read_blocks)
+
+    write_total_gb = write_block_mb * write_num_blocks / 1024
+    read_total_gb = read_block_mb * read_num_blocks / 1024
+
+    config = create_benchmark_config(
+        buffer_size, iterations,
+        threads_counts=[write_cfg.thread_count, read_cfg.thread_count],
+        block_sizes_mb=[write_block_mb, read_block_mb],
+        implementation="threaded_tunable",
+        total_data_size_gb=total_gb,
+        num_blocks=num_blocks,
+        tunable_write_config=write_cfg.to_dict(),
+        tunable_read_config=read_cfg.to_dict(),
+        tunable_concurrent_config=get_tunable_config("concurrent").to_dict(),
+    )
+
+    buffer, buffer_cleaning, view, view_cleaning = allocate_buffers(buffer_size, verify)
+    file_names_cleaning, indices_cleaning, block_size_cleaning = setup_cleaning_files()
+    await write_blocks(block_size_cleaning, view_cleaning, indices_cleaning, file_names_cleaning)
+
+    write_results = {}
+    read_results = {}
+
+    # --- Write pass ---
+    if write_num_blocks < (num_blocks or write_num_blocks + 1):
+        print(f"  Note: capped write blocks to {write_num_blocks} (buffer={buffer_size//(1024**3)}GB, block={write_block_mb}MB)")
+    file_names_write = generate_dest_file_names("final", write_num_blocks)
+
+    print(f"\n  Write pass: block={write_block_mb}MB, threads={write_cfg.thread_count}, blocks={write_num_blocks}, total={write_total_gb:.1f}GB")
+    times_write = []
+    for i in range(iterations):
+        clean_files(file_names_write)
+        blocks_indices = random.sample(range(max_write_blocks), write_num_blocks)
+        tw = await run_tunable_write(
+            write_block_size, buffer, blocks_indices, file_names_write,
+            buffer_cleaning, file_names_cleaning, indices_cleaning,
+            block_size_cleaning, view, verify
+        )
+        if tw is None:
+            print(f"    Write iteration {i} failed, skipping")
+            continue
+        times_write.append(tw)
+
+    if not times_write:
+        print("    All write iterations failed!")
+        return
+    avg_write = statistics.mean(times_write)
+    write_throughput = write_total_gb / avg_write
+    print(f"    Write: {avg_write*1000:.2f}ms ({write_throughput:.2f} GB/s)")
+
+    write_results[str(write_cfg.thread_count)] = {str(write_block_mb): avg_write}
+
+    # Clean write files before starting read pass
+    clean_files(file_names_write)
+
+    # --- Read pass ---
+    if read_num_blocks < (num_blocks or read_num_blocks + 1):
+        print(f"  Note: capped read blocks to {read_num_blocks} (buffer={buffer_size//(1024**3)}GB, block={read_block_mb}MB)")
+    file_names_read = generate_dest_file_names("final", read_num_blocks)
+
+    # Write the files that we'll read (using read block size)
+    clean_files(file_names_read)
+    blocks_indices_read_setup = random.sample(range(max_read_blocks), read_num_blocks)
+    await run_tunable_write(
+        read_block_size, buffer, blocks_indices_read_setup, file_names_read,
+        buffer_cleaning, file_names_cleaning, indices_cleaning,
+        block_size_cleaning, view, False
+    )
+
+    print(f"\n  Read pass: block={read_block_mb}MB, threads={read_cfg.thread_count}, blocks={read_num_blocks}, total={read_total_gb:.1f}GB")
+    times_read = []
+    for i in range(iterations):
+        blocks_indices = random.sample(range(max_read_blocks), read_num_blocks)
+        tr = await run_tunable_read(
+            read_block_size, buffer, blocks_indices, file_names_read,
+            buffer_cleaning, file_names_cleaning, indices_cleaning,
+            block_size_cleaning, view, verify
+        )
+        if tr is None:
+            print(f"    Read iteration {i} failed, skipping")
+            continue
+        times_read.append(tr)
+
+    if not times_read:
+        print("    All read iterations failed!")
+        return
+    avg_read = statistics.mean(times_read)
+    read_throughput = read_total_gb / avg_read
+    print(f"    Read:  {avg_read*1000:.2f}ms ({read_throughput:.2f} GB/s)")
+
+    read_results[str(read_cfg.thread_count)] = {str(read_block_mb): avg_read}
+
+    clean_files(file_names_write)
+    clean_files(file_names_read)
+
+    # --- Concurrent pass ---
+    concurrent_cfg = get_tunable_config("concurrent")
+    concurrent_block_mb = concurrent_cfg.block_size_mb or 32
+    concurrent_block_size = concurrent_block_mb * 1024 * 1024
+    max_concurrent_blocks = buffer_size // concurrent_block_size
+
+    if total_gb is not None:
+        concurrent_half_blocks = min(int((total_gb * 1024 / 2) / concurrent_block_mb), max_concurrent_blocks // 2)
+    else:
+        concurrent_half_blocks = min(num_blocks, max_concurrent_blocks // 2)
+
+    concurrent_total_gb = concurrent_block_mb * concurrent_half_blocks * 2 / 1024
+    half_max = max_concurrent_blocks // 2
+
+    file_names_cwrite = generate_dest_file_names("conc_write", concurrent_half_blocks)
+    file_names_cread = generate_dest_file_names("conc_read", concurrent_half_blocks)
+
+    # Pre-write read files for concurrent test
+    read_indices_setup = random.sample(range(half_max, max_concurrent_blocks), concurrent_half_blocks)
+    threaded_tunable_configure(concurrent_cfg)
+    await threaded_tunable_write_blocks(
+        concurrent_block_size, buffer, read_indices_setup, file_names_cread
+    )
+
+    print(f"\n  Concurrent pass: block={concurrent_block_mb}MB, threads={concurrent_cfg.thread_count}, "
+          f"blocks={concurrent_half_blocks}×2, total={concurrent_total_gb:.1f}GB")
+
+    concurrent_results = {}
+    times_concurrent = []
+    for i in range(iterations):
+        # Clean cache before concurrent
+        await threaded_tunable_read_blocks(
+            block_size_cleaning, buffer_cleaning, indices_cleaning, file_names_cleaning
+        )
+        clean_files(file_names_cwrite)
+
+        write_indices = random.sample(range(0, half_max), concurrent_half_blocks)
+
+        threaded_tunable_configure(concurrent_cfg)
+        start_concurrent = time.perf_counter()
+        write_task = threaded_tunable_write_blocks(
+            concurrent_block_size, buffer, write_indices, file_names_cwrite
+        )
+        read_task = threaded_tunable_read_blocks(
+            concurrent_block_size, buffer, read_indices_setup, file_names_cread
+        )
+        await asyncio.gather(write_task, read_task)
+        elapsed_concurrent = time.perf_counter() - start_concurrent
+        times_concurrent.append(elapsed_concurrent)
+
+    clean_files(file_names_cwrite)
+    clean_files(file_names_cread)
+
+    if times_concurrent:
+        avg_concurrent = statistics.mean(times_concurrent)
+        concurrent_throughput = concurrent_total_gb / avg_concurrent
+        print(f"    Concurrent: {avg_concurrent*1000:.2f}ms ({concurrent_throughput:.2f} GB/s)")
+        concurrent_results[str(concurrent_cfg.thread_count)] = {str(concurrent_block_mb): avg_concurrent}
+
+    # Build throughput sections (GB/s) alongside raw time sections
+    write_throughput_results = {}
+    for tc, bsizes in write_results.items():
+        write_throughput_results[tc] = {bs: write_total_gb / t for bs, t in bsizes.items()}
+
+    read_throughput_results = {}
+    for tc, bsizes in read_results.items():
+        read_throughput_results[tc] = {bs: read_total_gb / t for bs, t in bsizes.items()}
+
+    concurrent_throughput_results = {}
+    for tc, bsizes in concurrent_results.items():
+        concurrent_throughput_results[tc] = {bs: concurrent_total_gb / t for bs, t in bsizes.items()}
+
     all_results = {
         'config': config,
         'write': write_results,
+        'write_throughput_gbs': write_throughput_results,
         'read': read_results,
-        'concurrent': concurrent_results
+        'read_throughput_gbs': read_throughput_results,
+        'concurrent': concurrent_results,
+        'concurrent_throughput_gbs': concurrent_throughput_results,
     }
+    from utils.checkpoints_utils import save_incremental_results
     save_incremental_results(output_file, all_results)
-    
+
+    clean_files(file_names_cleaning)
+
     total_time = time.perf_counter() - start_time
     print_benchmark_summary(total_time, output_file)
-    
     return all_results
+
+
+async def tunable_data_benchmark(total_gb, iterations, buffer_size, test_name, verify=False):
+    """Data mode wrapper: calculates num_blocks from total_gb and delegates to tunable_benchmark."""
+    return await tunable_benchmark(
+        num_blocks=None, iterations=iterations, buffer_size=buffer_size,
+        test_name=test_name, total_gb=total_gb, verify=verify
+    )
 
 
 if __name__ == "__main__":
@@ -391,8 +671,8 @@ if __name__ == "__main__":
         '--mode',
         type=str,
         choices=['blocks', 'data', 'concurrent'],
-        default='blocks',
-        help='Benchmark mode: "blocks" for fixed number of blocks, "data" for fixed total data size, "concurrent" for simultaneous read/write (default: blocks)'
+        default='data',
+        help='Benchmark mode: "data" for fixed total data size (default), "blocks" for fixed number of blocks, "concurrent" for simultaneous read/write'
     )
     parser.add_argument(
         '--backend',
@@ -433,7 +713,7 @@ if __name__ == "__main__":
     )
     parser.add_argument(
         '--total-gb',
-        type=int,
+        type=float,
         default=100,
         help='Total data size in GB (for total mode, default: 100)'
     )
@@ -453,29 +733,19 @@ if __name__ == "__main__":
     
     args = parser.parse_args()
     
-    # Clean up any leftover files from previous runs
-    print("="*80)
-    print("CLEANING UP STORAGE")
-    print("="*80)
-    print(f"Removing all files from {STORAGE_PATH}...")
-    import subprocess
-    try:
-        subprocess.run(f"rm -f {STORAGE_PATH}/*", shell=True, check=False)
-        print("Cleanup complete\n")
-    except Exception as e:
-        print(f"Warning: Cleanup failed: {e}\n")
-    
     # Load tunable config if provided
+    tunable_config_loaded = False
     if args.tunable_config:
         if args.backend != "threaded_tunable":
             print("Warning: --tunable-config is only used with --backend threaded_tunable, ignoring")
         else:
             load_tunable_config(args.tunable_config)
+            tunable_config_loaded = True
 
     # Convert buffer size from GB to bytes
     buffer_size = args.buffer_size * 1024 * 1024 * 1024
     threads_counts = [16, 32, 64]
-    
+
     print("="*80)
     print("I/O BENCHMARK CONFIGURATION")
     print("="*80)
@@ -488,14 +758,45 @@ if __name__ == "__main__":
     print(f"Cluster:         {CLUSTER}")
     print(f"Test_name:       {args.test_name}")
     print(f"Verify:          {args.verify}")
-    if args.tunable_config and args.backend == "threaded_tunable":
+    if tunable_config_loaded:
         print(f"Tunable Config:  {args.tunable_config}")
+        write_cfg = get_tunable_config("write")
+        read_cfg = get_tunable_config("read")
+        print(f"  Write: threads={write_cfg.thread_count}, block={write_cfg.block_size_mb}MB")
+        print(f"  Read:  threads={read_cfg.thread_count}, block={read_cfg.block_size_mb}MB")
 
-    if args.mode == 'blocks':
+    # Route tunable with loaded config to dedicated benchmark function
+    if tunable_config_loaded and args.mode == 'data':
+        print(f"Total Data:      {args.total_gb} GB")
+        print("="*80)
+        print()
+
+        asyncio.run(tunable_data_benchmark(
+            total_gb=args.total_gb,
+            iterations=args.iterations,
+            buffer_size=buffer_size,
+            test_name=args.test_name,
+            verify=args.verify
+        ))
+
+    elif tunable_config_loaded and args.mode == 'blocks':
         print(f"Num Blocks:      {args.num_blocks}")
         print("="*80)
         print()
-        
+
+        asyncio.run(tunable_benchmark(
+            num_blocks=args.num_blocks,
+            iterations=args.iterations,
+            buffer_size=buffer_size,
+            test_name=args.test_name,
+            verify=args.verify
+        ))
+
+    elif args.mode == 'blocks':
+        print(f"Num Blocks:      {args.num_blocks}")
+        print("="*80)
+        print()
+
         asyncio.run(blocks_benchmark(
             num_blocks=args.num_blocks,
             iterations=args.iterations,

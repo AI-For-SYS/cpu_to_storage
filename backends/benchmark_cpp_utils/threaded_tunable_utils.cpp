@@ -466,9 +466,18 @@ bool threaded_tunable_write_blocks(torch::Tensor buffer,
 
       // Sync strategy before close
       if (cfg.sync_strategy == 1) {
-        fdatasync(fd);
+        if (fdatasync(fd) != 0 && errno != ENOSYS) {
+          std::cerr << "[WARN] fdatasync failed: " << tmp_path
+                    << " - " << std::strerror(errno) << " (continuing)\n";
+        }
       } else if (cfg.sync_strategy == 2) {
-        sync_file_range(fd, 0, block_size, SYNC_FILE_RANGE_WRITE);
+        if (sync_file_range(fd, 0, block_size, SYNC_FILE_RANGE_WRITE) != 0) {
+          // Not supported on NFS, S3 FUSE mounts — fall back silently
+          if (errno != ENOSYS && errno != ESPIPE) {
+            std::cerr << "[WARN] sync_file_range failed: " << tmp_path
+                      << " - " << std::strerror(errno) << " (continuing)\n";
+          }
+        }
       }
 
       if (close(fd) != 0) {

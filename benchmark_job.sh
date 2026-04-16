@@ -58,6 +58,21 @@ elif [ "$MODE" = "compare-short" ] || [ "$MODE" = "compare-full" ]; then
         BACKENDS="cpp threaded_tunable python_self_imp python_aiofiles"
     fi
 
+    # Set parameters based on compare mode
+    if [ "$MODE" = "compare-short" ]; then
+        BUFFER_SIZE=1
+        ITERATIONS=1
+        BLOCK_SIZES="4 8"
+        TOTAL_GB=0.5
+        TEST_NAME=io_throughput_short
+    else
+        BUFFER_SIZE=100
+        ITERATIONS=5
+        BLOCK_SIZES="2 4 8 16 32 64"
+        TOTAL_GB=30
+        TEST_NAME=io_throughput
+    fi
+
     for CURRENT_BACKEND in $BACKENDS; do
         echo ""
         echo "=========================================="
@@ -70,21 +85,24 @@ elif [ "$MODE" = "compare-short" ] || [ "$MODE" = "compare-full" ]; then
             CURRENT_TUNABLE_FLAG="--tunable-config $TUNABLE_CONFIG"
         fi
 
-        if [ "$MODE" = "compare-short" ]; then
+        # Data mode (write + read + concurrent for tunable)
+        python compare_file_operations.py \
+            --mode data --backend $CURRENT_BACKEND \
+            --buffer-size $BUFFER_SIZE --iterations $ITERATIONS \
+            --block-sizes $BLOCK_SIZES --total-gb $TOTAL_GB \
+            --test-name $TEST_NAME \
+            $CURRENT_TUNABLE_FLAG
+
+        # Concurrent mode for non-tunable backends (tunable already runs concurrent in data mode)
+        if [ "$CURRENT_BACKEND" != "threaded_tunable" ]; then
             python compare_file_operations.py \
-                --mode blocks --backend $CURRENT_BACKEND \
-                --buffer-size 1 --iterations 1 \
-                --block-sizes 4 8 --num-blocks 10 \
-                --test-name io_throughput_short \
-                $CURRENT_TUNABLE_FLAG
-        else
-            python compare_file_operations.py \
-                --mode blocks --backend $CURRENT_BACKEND \
-                --buffer-size 100 --iterations 5 \
-                --block-sizes 2 4 8 16 32 64 --num-blocks 1000 \
-                --test-name io_throughput \
-                $CURRENT_TUNABLE_FLAG
+                --mode concurrent --backend $CURRENT_BACKEND \
+                --buffer-size $BUFFER_SIZE --iterations $ITERATIONS \
+                --block-sizes $BLOCK_SIZES --total-gb $TOTAL_GB \
+                --test-name $TEST_NAME
         fi
+
+        echo "--- Finished $CURRENT_BACKEND ---"
     done
 else
     echo "Unknown mode: $MODE. Use 'short', 'full', 'compare-short', or 'compare-full'."

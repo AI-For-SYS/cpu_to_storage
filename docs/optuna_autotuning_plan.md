@@ -505,112 +505,175 @@ setup(
 
 ## 6. Optuna Integration: `optuna_tuner.py`
 
-### 6.1 Architecture
+### 6.1 Architecture and Design Rationale
 
 ```
-optuna_tuner.py                  New file. Entry point for auto-tuning.
+optuna_tuner.py                  Entry point for auto-tuning.
     |
-    +---> Defines Optuna study (sampler, pruner, search space)
-    +---> Objective function: runs a short benchmark, returns throughput
-    +---> Builds ThreadedTunableConfig per trial, calls configure() to apply
-    +---> Uses existing benchmark_core.py for buffer alloc and iteration
+    +---> Three sequential studies: write, read, concurrent
+    +---> Each study finds the best config for that operation
+    +---> All run in a single job, sharing pre-allocated buffers
+    +---> One output file with best configs for all three operations
     |
     v
-Results: best params, parameter importance, optimization history
+Results: best_config_{timestamp}.json (contains write, read, concurrent sections)
 ```
 
-### 6.2 Objective Function
+**Why three separate studies:**
 
+In production KV cache offload, the caller knows which operation is needed:
+- **Offloading** KV cache layers → write → use best write config
+- **Reloading** KV cache layers → read → use best read config
+- **Both simultaneously** → use best concurrent config
+
+Different operations may have different optimal parameters. For example:
+- Writes may benefit from `fallocate=true`, `sync_strategy=none`, higher thread count
+- Reads may benefit from `o_noatime=true`, `prefetch_depth=4`, `fadvise=sequential`
+- Concurrent may need a compromise on thread count to avoid contention
+
+All three studies run sequentially in a single job to find the best config for each.
+
+**Why all three always run together:**
+
+In production you always need all three configs ready — you don't know in advance which operation will be needed. Running `optuna_tuner.py` produces all three in one invocation.
+
+### 6.2 Objective Functions
+
+Each study has its own objective, measuring the relevant operation:
+
+**Write study:**
 ```python
-def objective(trial: optuna.Trial, mode: str = "write") -> float:
-    """Single Optuna trial. Returns throughput in GB/s (maximize)."""
-
-    # 1. Sample parameters into typed config
-    config = ThreadedTunableConfig(
-        thread_count  = trial.suggest_int("thread_count", 4, 128, log=True),
-        o_direct      = trial.suggest_categorical("o_direct", [True, False]),
-        fadvise_hint  = FadviseHint(trial.suggest_categorical("fadvise_hint", [e.value for e in FadviseHint])),
-        io_chunk_kb   = trial.suggest_categorical("io_chunk_kb", [0, 256, 512, 1024, 2048, 4096]),
-        cpu_affinity  = trial.suggest_categorical("cpu_affinity", [True, False]),
-    )
-    block_size_mb = trial.suggest_categorical("block_size_mb", [2, 4, 8, 16, 32, 64, 128])
-
-    # Conditional: read-only params
-    if mode in ("read", "concurrent"):
-        config.o_noatime      = trial.suggest_categorical("o_noatime", [True, False])
-        config.prefetch_depth = trial.suggest_int("prefetch_depth", 0, 8)
-
-    # Conditional: write-only params
-    if mode in ("write", "concurrent"):
-        config.fallocate      = trial.suggest_categorical("fallocate", [True, False])
-        config.sync_strategy  = SyncStrategy(trial.suggest_categorical("sync_strategy", [e.value for e in SyncStrategy]))
-
-    # 2. Apply typed config to C++ backend
+def write_objective(trial):
+    config = sample_all_params(trial)  # all params including read-only ones
     configure(config)
-
-    # 3. Run short benchmark (reduced data for speed)
-    elapsed = run_trial_benchmark(block_size_mb, mode)
-
-    # 4. Return throughput
-    total_gb = TRIAL_DATA_SIZE_GB
-    return total_gb / elapsed
+    time_write = run_write_benchmark(block_size_mb)
+    return data_gb / time_write  # maximize write throughput
 ```
+
+**Read study:**
+```python
+def read_objective(trial):
+    config = sample_all_params(trial)
+    configure(config)
+    # Write files first, clean cache, then measure read
+    write_files(block_size_mb)
+    clean_cache()
+    time_read = run_read_benchmark(block_size_mb)
+    return data_gb / time_read  # maximize read throughput
+```
+
+**Concurrent study:**
+```python
+def concurrent_objective(trial):
+    config = sample_all_params(trial)
+    configure(config)
+    clean_cache()
+    time_total = run_concurrent_benchmark(block_size_mb)  # write + read simultaneously
+    return total_data_gb / time_total  # maximize combined throughput
+```
+
+All three sample the full parameter space (including write-only and read-only params). Optuna naturally discovers which params matter for each operation — write-only params will have zero importance in the read study and vice versa.
 
 ### 6.3 Study Configuration
 
 ```python
-study = optuna.create_study(
-    study_name=f"threaded_tunable_{mode}_tuning",
-    direction="maximize",
-    sampler=optuna.samplers.TPESampler(
-        n_startup_trials=20,       # random exploration first
-        multivariate=True,         # model parameter interactions
-    ),
-    pruner=optuna.pruners.MedianPruner(
-        n_startup_trials=10,
-        n_warmup_steps=0,
-    ),
-    storage="sqlite:///results/optuna_study.db",  # persistent, resume across LSF jobs
-)
-
-study.optimize(objective, n_trials=200, timeout=3600)
+for mode in ["write", "read", "concurrent"]:
+    study = optuna.create_study(
+        study_name=f"threaded_tunable_{mode}",
+        direction="maximize",
+        sampler=optuna.samplers.TPESampler(
+            n_startup_trials=20,
+            multivariate=True,
+        ),
+        pruner=optuna.pruners.MedianPruner(
+            n_startup_trials=10,
+            n_warmup_steps=0,
+        ),
+        storage="sqlite:///results/optuna_study.db",
+        load_if_exists=True,
+    )
+    study.optimize(objective_fn[mode], n_trials=200, timeout=per_mode_timeout)
 ```
 
-### 6.4 Separate Studies
+### 6.4 Trial Benchmark Design
 
-| Study | Objective | Read-Only Params | Write-Only Params |
-|-------|-----------|-----------------|-------------------|
-| `threaded_tunable_write_tuning` | Max write throughput | excluded | fallocate, sync_strategy |
-| `threaded_tunable_read_tuning` | Max read throughput | o_noatime, prefetch_depth | excluded |
-| `threaded_tunable_concurrent_tuning` | Max combined throughput | all | all |
+**Write trial:**
+1. Write blocks to storage → measure `time_write`
+2. Clean up files
 
-### 6.5 Trial Benchmark Design
+**Read trial:**
+1. Write blocks to storage (setup, not measured)
+2. Clean cache — read 100GB from `/dev/shm`
+3. Read blocks from storage → measure `time_read`
+4. Clean cache
 
-Each trial must produce realistic numbers for the KV cache offload use case (CPU memory ↔ storage). This means:
+**Concurrent trial:**
+1. Pre-write read files (setup)
+2. Clean cache
+3. Write + Read simultaneously → measure `time_total`
+4. Clean up
 
-- **Buffers**: `torch.Tensor` with `dtype=float16`, `pin_memory=True` — same as production checkpoint buffers. Pre-allocate once at startup, reuse across all trials. The tunable backend receives `torch::Tensor` (not raw pointers), matching the baseline `cpp` API exactly.
+**Buffers and data:**
+
+- **Buffers**: `torch.Tensor` with `dtype=float16`, `pin_memory=True` — same as production checkpoint buffers. Pre-allocate once at startup, reuse across all three studies.
 - **Cleaning buffer**: Separate 50GB `torch.Tensor` (float16, pinned), 3200 × 32MB files on `/dev/shm` — same as existing `benchmark_core.allocate_buffers()`.
 - **Total data per trial**: 10GB (enough for stable measurement, fast enough for iteration)
-- **Iterations**: 2 (take mean, discard first as warmup)
+- **Iterations**: 3 (discard first as warmup, average remaining 2)
 - **File cleanup**: Clean benchmark files between trials to prevent disk filling
 
-**Cache cleaning per mode** (mandatory for realistic results):
+**Estimated times:**
 
-| Mode | Cache cleaning | Why |
-|------|---------------|-----|
-| **Write** | Not needed | Data originates from CPU memory (hot tensor), written to cold storage. Page cache is irrelevant — no prior read to cache. |
-| **Read** | **Mandatory** — read 100GB (3200 × 32MB) from `/dev/shm` using `threaded_tunable_read_blocks` after every write phase, before every read measurement | Without this, reads hit page cache instead of storage. Optimizing for cache hits produces useless params for real KV cache reload. |
-| **Concurrent** | **Mandatory** — clean before each concurrent iteration | Same reason: read portion would hit warm cache otherwise. |
-
-Cache cleaning uses the tunable backend's own read function (not baseline `cpp_read_blocks`) to avoid loading a second extension and to match the existing pattern where each backend cleans cache with its own implementation.
-
-**Estimated trial times:**
-
-| Mode | Per trial | 200 trials |
-|------|-----------|------------|
+| Study | Per trial | 200 trials |
+|-------|-----------|------------|
 | Write | ~5s | ~17 min |
-| Read | ~25s (includes 100GB cache clean) | ~80 min |
+| Read | ~25s (includes cache clean) | ~80 min |
 | Concurrent | ~30s | ~100 min |
+| **Total (all three)** | | **~3.5 hours** |
+
+### 6.5 Output: Single Config File with All Three Best Configs
+
+```
+results/best_config_{timestamp}.json
+```
+
+`block_size_mb` is a first-class field in `ThreadedTunableConfig`, not stored in metadata. Each mode's config contains the complete definition: thread count, block size, and all I/O params.
+
+```json
+{
+  "write": {
+    "thread_count": 31, "block_size_mb": 128,
+    "o_noatime": true, "o_direct": false,
+    "fadvise_hint": "sequential", "io_chunk_kb": 0, "prefetch_depth": 0,
+    "fallocate": false, "sync_strategy": "none", "cpu_affinity": false
+  },
+  "read": {
+    "thread_count": 100, "block_size_mb": 16,
+    "o_noatime": true, "o_direct": false,
+    "fadvise_hint": "random", "io_chunk_kb": 16384, "prefetch_depth": 0,
+    "fallocate": false, "sync_strategy": "none", "cpu_affinity": false
+  },
+  "concurrent": {
+    "thread_count": 72, "block_size_mb": 128,
+    "o_noatime": true, "o_direct": false,
+    "fadvise_hint": "random", "io_chunk_kb": 4096, "prefetch_depth": 0,
+    "fallocate": false, "sync_strategy": "none", "cpu_affinity": false
+  },
+  "_metadata": {
+    "storage_path": "/mnt/storage",
+    "total_trials_per_mode": 60,
+    "write_best_throughput_gbs": 14.31,
+    "write_best_trial": 29,
+    "read_best_throughput_gbs": 58.63,
+    "read_best_trial": 55,
+    "concurrent_best_throughput_gbs": 14.81,
+    "concurrent_best_trial": 10
+  }
+}
+```
+
+The benchmark loads this file and uses the matching section per operation:
+- `data`/`blocks` mode → uses `write` config for write phase (including its block_size_mb), `read` config for read phase (including its block_size_mb)
+- `concurrent` mode → uses `concurrent` config for both
 
 ### 6.6 Constraint Handling
 
@@ -629,57 +692,64 @@ Cache cleaning uses the tunable backend's own read function (not baseline `cpp_r
 
 ### 7.1 `optuna_tuner.py` — Tuning Entry Point
 
+Uses presets to reduce CLI complexity. Most runs need no arguments:
+
+```bash
+python optuna_tuner.py                                     # full preset (default)
+python optuna_tuner.py --preset short                      # quick sanity check
+python optuna_tuner.py --n-trials 500                      # override trial count per mode
 ```
-python optuna_tuner.py \
-    --mode write|read|concurrent \
-    --n-trials 200 \
-    --timeout 3600 \
-    --data-gb 10 \
-    --backend threaded_tunable \
-    --storage-path /mnt/benchmark_tmp \
-    --study-db results/optuna_study.db \
-    --export-config results/best_write_config.json
-```
+
+No `--mode` flag — the tuner always runs all three studies (write, read, concurrent) sequentially.
+
+**Presets:**
+
+| Preset | Trials per mode | Timeout per mode | Data/trial | Buffer | Iterations | Purpose |
+|--------|----------------|-----------------|-----------|--------|------------|---------|
+| `short` | 20 | 300s | 1GB | 1GB | 1 | Verify Optuna wiring works |
+| `full` | 60 | none | 10GB | 100GB | 3 | Real optimization run |
+
+Total time: `short` ~6 min, `full` ~1.5 hours (all three modes at ~26s/trial).
+
+**Explored parameters (4):** `thread_count`, `block_size_mb`, `io_chunk_kb`, `fadvise_hint`
+
+**Frozen parameters (6):** `o_direct=off`, `cpu_affinity=off`, `o_noatime=true`, `prefetch_depth=0`, `fallocate=off`, `sync_strategy=none`
+
+**CLI arguments:**
 
 | Argument | Default | Description |
 |----------|---------|-------------|
-| `--mode` | `write` | Which I/O direction to optimize |
-| `--n-trials` | `200` | Max Optuna trials |
-| `--timeout` | `3600` | Max seconds for the study |
-| `--data-gb` | `10` | Total data per trial (kept small for speed) |
-| `--backend` | `threaded_tunable` | Which tunable backend to optimize (future: `iouring_tunable`) |
-| `--storage-path` | from `.env` | Where benchmark files are written |
-| `--study-db` | `results/optuna_study.db` | SQLite path for checkpoint/resume |
-| `--export-config` | `results/best_{mode}_config.json` | Where to save best params |
+| `--preset` | `full` | `short` or `full` — sets trials, data size, buffer, timeout |
+| `--n-trials` | from preset | Override max Optuna trials per mode |
+| `--timeout` | from preset | Override max seconds per mode |
+| `--export-config` | `results/best_config_{timestamp}.json` | Where to save best params |
+
+`storage-path` and `study-db` use sensible defaults: `STORAGE_PATH` from `.env`, `results/optuna_study.db` for SQLite.
 
 ### 7.2 `compare_file_operations.py` — Benchmark with All Backends
 
 The benchmark and optimization stages are **separate**:
 
-1. **Optimize** (run once per system): `optuna_tuner.py` → saves `best_{mode}_config.json`
-2. **Benchmark** (run anytime): `compare_file_operations.py` → runs all backends side-by-side, `threaded_tunable` uses the saved config
+1. **Optimize** (run once per system): `optuna_tuner.py` → saves `best_config_{timestamp}.json`
+2. **Benchmark** (run anytime): `compare_file_operations.py` → runs backends side-by-side, `threaded_tunable` uses the saved config
 
-Add `threaded_tunable` as a backend choice and `--tunable-config` to load saved Optuna results:
+**Default benchmark mode is `data`** — moves the same total data (GB) regardless of block size. This ensures fair comparison: all backends move the same amount of data, eliminating page cache illusions where small blocks appear faster because less total data is written.
 
 ```bash
-# Run a single backend
-python compare_file_operations.py \
-    --backend threaded_tunable \
-    --tunable-config results/best_write_config.json \
-    --mode data --total-gb 100 --iterations 5
-
-# Run ALL backends in one job (apples-to-apples comparison)
-python compare_file_operations.py \
-    --backend all \
-    --tunable-config results/best_write_config.json \
-    --mode data --total-gb 100 --iterations 5
+# Compare cpp (sweep) vs threaded_tunable (best config) — uses data mode
+./run_benchmark_on_lsf.sh compare-short "cpp threaded_tunable" results/best_config.json
 ```
 
-When `--backend all` is used:
-- `cpp`, `python_self_imp`, `python_aiofiles` run with their defaults
-- `threaded_tunable` loads params from `--tunable-config`
-- All backends run under the same conditions (same machine, same buffer, same cache cleaning)
-- Results are saved per-backend as usual, directly comparable in plotter
+**Benchmark behavior differs by backend:**
+
+- **`cpp` and other untuned backends**: sweep all thread counts × block sizes (hardcoded `[16, 32, 64]` × `[2, 4, 8, 16, 32, 64]`). Each combination moves the same `total_gb`. Number of blocks = `total_gb * 1024 / block_size_mb`.
+- **`threaded_tunable` with `--tunable-config`**: runs **only the best configurations** found by Optuna. Write pass uses write config's `block_size_mb` and `thread_count`. Read pass uses read config's (different) `block_size_mb` and `thread_count`. Both move the same `total_gb`.
+
+**Config switching per operation:** The config file contains separate best params for write, read, and concurrent. The benchmark loads the matching section:
+- `data`/`blocks` mode: applies `write` config (including block_size_mb) before write phase, `read` config before read phase
+- `concurrent` mode: applies `concurrent` config
+
+This produces an apples-to-apples comparison: same total data moved, cpp's best across the sweep vs. threaded_tunable's Optuna-optimized per-operation configs.
 
 ### 7.3 Running Modes
 
@@ -688,21 +758,21 @@ Both stages run on any Linux machine. LSF scripts are optional wrappers.
 **Direct (any Linux machine):**
 ```bash
 # Stage 1: Optimize (once per system)
-python optuna_tuner.py --mode write --n-trials 200
+python optuna_tuner.py                                      # full preset
+python optuna_tuner.py --preset short                       # quick sanity check
 
-# Stage 2: Benchmark (all backends, including tuned threaded_tunable)
-python compare_file_operations.py --backend all \
-    --tunable-config results/best_write_config.json \
-    --mode data --total-gb 100 --iterations 5
+# Stage 2: Benchmark (compare backends)
+./run_benchmark_on_lsf.sh compare-full "cpp threaded_tunable" results/best_config.json
 ```
 
 **LSF:**
 ```bash
 # Stage 1
-./scripts/run_optuna_on_lsf.sh write 200
+./scripts/run_optuna_on_lsf.sh                              # full preset
+./scripts/run_optuna_on_lsf.sh short                        # quick sanity check
 
 # Stage 2
-./scripts/run_benchmark_on_lsf.sh full all results/best_write_config.json
+./run_benchmark_on_lsf.sh compare-full "cpp threaded_tunable" results/best_config.json
 ```
 
 ---
@@ -770,61 +840,37 @@ Results saved per-backend: results/data_*_cpp.json, results/data_*_threaded_tuna
 Plot: python plotter.py data results/*.json
 ```
 
-### 8.3 Exported Best Config (`results/best_{mode}_config.json`)
+### 8.3 Exported Best Config (`results/best_config_{timestamp}.json`)
 
-Saved by `optuna_tuner.py` via `ThreadedTunableConfig.save()`. The file contains the tunable parameters (loadable by `ThreadedTunableConfig.load()`) plus metadata added by the tuner:
-
-```json
-{
-  "thread_count": 48,
-  "o_noatime": true,
-  "o_direct": false,
-  "fadvise_hint": "sequential",
-  "io_chunk_kb": 2048,
-  "prefetch_depth": 4,
-  "fallocate": true,
-  "sync_strategy": "none",
-  "cpu_affinity": false,
-  "_metadata": {
-    "study_name": "threaded_tunable_write_tuning",
-    "trial_number": 142,
-    "total_trials": 200,
-    "measured_throughput_gbs": 12.4,
-    "storage_path": "/mnt/storage",
-    "block_size_mb": 32
-  }
-}
-```
-
-`ThreadedTunableConfig.load()` ignores the `_metadata` key (only reads known fields via `.get()`). The metadata is informational — tells you which study produced this config and what throughput was measured.
+Same format as section 6.5. `block_size_mb` is part of each mode's config, not metadata. `ThreadedTunableConfig.from_dict()` reads a single section by key.
 
 ### 8.4 Workflow Examples
 
 **Full workflow (first time on a system):**
 ```
-1. Optimize:    python optuna_tuner.py --mode write --n-trials 200
-               → saves results/best_write_config.json
+1. Optimize:    python optuna_tuner.py
+               → runs write, read, concurrent studies (60 trials each, ~1.5 hours)
+               → saves results/best_config_{timestamp}.json
 
-2. Benchmark:   python compare_file_operations.py --backend all \
-                    --tunable-config results/best_write_config.json \
-                    --mode data --total-gb 100 --iterations 5
-               → runs cpp, threaded_tunable, python_self_imp, etc. side-by-side
+2. Benchmark:   ./run_benchmark_on_lsf.sh compare-full "cpp threaded_tunable" results/best_config.json
+               → uses data mode: all backends move same total data (100GB)
+               → cpp sweeps thread counts × block sizes
+               → threaded_tunable uses best config per operation
 
-3. Compare:     python plotter.py data results/*.json
-               → overlays all backends on same chart
+3. Compare:     python plotter.py data results/*cpp*.json results/*threaded_tunable*.json
+               → overlays both backends on same chart
 ```
 
-**Just run threaded_tunable (other baselines already exist):**
+**Quick sanity check (verify Optuna wiring):**
 ```
-python compare_file_operations.py --backend threaded_tunable \
-    --tunable-config results/best_write_config.json \
-    --mode data --total-gb 100 --iterations 5
+python optuna_tuner.py --preset short
+# 20 trials per mode × 3 modes, 1GB data, ~6 min total
 ```
 
 **Resume a partial Optuna study (e.g., LSF job timed out):**
 ```
-python optuna_tuner.py --mode write --n-trials 200 --study-db results/optuna_study.db
-# Picks up from where it left off (SQLite has all completed trials)
+python optuna_tuner.py
+# Picks up from where it left off — each mode's study resumes independently via SQLite
 ```
 
 ---
@@ -902,13 +948,17 @@ Baseline comparison: write +4.7%, read +5.6% (within 15% tolerance)
 
 ### Phase 3: Optuna Tuner
 1. Add `optuna` to dependencies in `setup_env.sh`
-2. Create `optuna_tuner.py` (project root) with objective function, study setup, CLI
-3. Wire up `ThreadedTunableConfig` + `configure()` from objective function
-4. Implement separate read/write/concurrent studies with conditional params
-5. Add SQLite storage for checkpoint/resume across LSF jobs
-6. Create `scripts/run_optuna_on_lsf.sh` — LSF submission wrapper (resource requests, job name, log path)
-7. Create `scripts/optuna_job.sh` — job script (source .env, activate venv, run `optuna_tuner.py`)
-8. Test with small study (20 trials) on remote
+2. Create `optuna_tuner.py` (project root) with:
+   - Presets (`short`/`full`) for trial count, data size, buffer, timeout
+   - Single combined study: each trial runs write → cache clean → read → cache clean (matches original cpp flow)
+   - All params explored together (write-only, read-only, shared)
+   - Objective: combined throughput (total data / total time for write + read)
+   - SQLite storage for checkpoint/resume
+   - End-of-study summary with best params, fANOVA importance, write/read/combined throughput
+   - Export single `best_config_{timestamp}.json` with all params
+3. Create `scripts/run_optuna_on_lsf.sh` — LSF submission wrapper
+4. Create `scripts/optuna_job.sh` — job script (source .env, activate venv, run tuner)
+5. Test with `--preset short` (20 trials) on remote
 
 ### Phase 4: Analysis and Validation
 1. Run full tuning study (200+ trials)
@@ -920,14 +970,79 @@ Baseline comparison: write +4.7%, read +5.6% (within 15% tolerance)
 
 ---
 
-## 11. Risks and Considerations
+## 11. Kubernetes Storage Compatibility
+
+The optimizer is designed to run on **any POSIX-mountable storage** attached to a Kubernetes pod. LLMD uses K8s; the storage type varies by deployment. Optuna discovers the best parameters for each specific storage — different storage → different optimal config.
+
+### 11.1 Supported Storage Types
+
+| Storage | K8s Mount | POSIX Support | Notes |
+|---------|-----------|---------------|-------|
+| **GPFS (Spectrum Scale)** | CSI driver | Full | HPC parallel FS, all params work |
+| **NFS (v3/v4)** | CSI / in-tree | Full | `fallocate` fails on v3 (caught), works on v4.2 |
+| **CephFS** | CSI driver | Full | Distributed FS, all params work |
+| **Ceph RBD** | CSI driver (ext4/xfs) | Full | Block device + local FS, all params work |
+| **Lustre** | CSI driver | Full | HPC parallel FS, all params work |
+| **S3 (FUSE mount)** | s3fs / goofys / Mountpoint | Partial | `O_DIRECT` fails, `fallocate` fails, `sync_file_range` may fail |
+| **Local NVMe/SSD** | Local PV (ext4/xfs) | Full | All params work, best performance |
+| **EBS / Azure Disk / GCE PD** | CSI driver (ext4/xfs) | Full | Cloud block storage, all params work |
+| **emptyDir (tmpfs)** | In-memory | Partial | `O_DIRECT` fails (no backing device) |
+| **hostPath** | Node local | Depends | Depends on host filesystem |
+
+### 11.2 Parameter Compatibility by Storage
+
+| Parameter | GPFS | NFS | S3 FUSE | CephFS | Lustre | tmpfs | Failure Handling |
+|-----------|------|-----|---------|--------|--------|-------|-----------------|
+| **O_NOATIME** | ✓ | ✓ | Ignored | ✓ | ✓ | ✓ | EPERM → retry without flag |
+| **O_DIRECT** | ✓ | ✓ | **✗** | ✓ | ✓ | **✗** | EINVAL → trial pruned |
+| **fadvise** | ✓ | ✓ | Ignored | ✓ | ✓ | Ignored | Advisory only, never fails |
+| **io_chunk_size** | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | Pure userspace logic |
+| **prefetch (readahead)** | ✓ | ✓ | Ignored | ✓ | ✓ | ✓ | Advisory, never fails |
+| **fallocate** | ✓ | ✗ v3 / ✓ v4.2 | **✗** | ✓ | ✓ | ✓ | EOPNOTSUPP → continue without |
+| **fdatasync** | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ENOSYS → warn and continue |
+| **sync_file_range** | ✓ | May fail | **✗** | ✓ | ✓ | ✓ | ENOSYS/ESPIPE → continue silently |
+| **cpu_affinity** | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | Kernel-level, no FS dependency |
+
+### 11.3 How Optuna Handles Unsupported Parameters
+
+When a parameter is not supported on the target storage:
+
+1. **C++ layer catches the error** — `O_DIRECT` open failure, `fallocate` EOPNOTSUPP, `sync_file_range` ENOSYS are all caught and handled gracefully (warn or skip)
+2. **The trial still produces a throughput measurement** — the unsupported parameter simply has no effect (or the operation proceeds without it)
+3. **Optuna learns the parameter is irrelevant** — since enabling/disabling it has no throughput impact, TPE assigns it low importance and stops exploring it
+4. **For fatal failures** (e.g., `O_DIRECT` on tmpfs where open itself fails) — the trial returns very low throughput or is pruned, and Optuna avoids that parameter combination
+
+This means you can run the same `optuna_tuner.py` on any storage type without modification. The optimizer automatically adapts to what the storage supports.
+
+### 11.4 Per-Storage Config Management
+
+Each storage type gets its own optimized config:
+
+```bash
+# Optimize for GPFS
+python optuna_tuner.py --mode write --storage-path /mnt/gpfs/benchmark --export-config results/best_write_gpfs.json
+
+# Optimize for NFS
+python optuna_tuner.py --mode write --storage-path /mnt/nfs/benchmark --export-config results/best_write_nfs.json
+
+# Use the right config at benchmark time
+python compare_file_operations.py --backend threaded_tunable --tunable-config results/best_write_gpfs.json
+```
+
+The `_metadata.storage_path` field in the config JSON records which storage the config was optimized for.
+
+---
+
+## 12. Risks and Considerations
 
 | Risk | Mitigation |
 |------|-----------|
-| O_DIRECT not supported on tmpfs (`/dev/shm`) | Detect at trial start; skip or mark as failed trial. Works on real filesystems (NFS, ext4, GPFS). |
-| `fallocate()` not supported on NFS | Catch `EOPNOTSUPP`, ignore gracefully (write still proceeds without pre-allocation) |
+| O_DIRECT not supported on tmpfs / S3 FUSE | C++ catches EINVAL at open(); Optuna prunes the trial or sees low throughput |
+| `fallocate()` not supported on NFSv3 / S3 FUSE | C++ catches `EOPNOTSUPP`, continues without pre-allocation |
+| `sync_file_range` not supported on NFS / S3 FUSE | C++ catches `ENOSYS`/`ESPIPE`, continues silently |
 | Noisy measurements on shared cluster | Use multiple iterations per trial, run during off-peak, consider using dedicated nodes via LSF resource requests |
 | Trial overhead (buffer alloc, file cleanup) | Allocate buffer once, reuse across trials. Clean up files between trials but don't re-create the buffer. |
 | Parameter interactions | TPESampler with `multivariate=True` models correlations. 20 startup random trials ensure exploration. |
-| Overfitting to specific storage | Run tuning on target storage system. Results may differ between /dev/shm, NFS, GPFS, NVMe. Store results per-storage. |
+| Overfitting to specific storage | Run tuning on target storage system. Results may differ between storage types. Store results per-storage. |
 | Tunable defaults ≠ baseline | Validate explicitly: run both with same thread count/block size, verify identical throughput. |
+| Config used on wrong storage | `_metadata.storage_path` records origin. User responsibility to match config to storage. |

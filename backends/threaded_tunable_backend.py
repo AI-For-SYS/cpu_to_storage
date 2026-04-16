@@ -29,6 +29,7 @@ class SyncStrategy(str, Enum):
 @dataclass
 class ThreadedTunableConfig:
     thread_count: int = 0                              # 0 = auto-detect (hardware_concurrency)
+    block_size_mb: int = 0                             # 0 = use benchmark default
     o_noatime: bool = False
     o_direct: bool = False
     fadvise_hint: FadviseHint = FadviseHint.NORMAL
@@ -44,21 +45,12 @@ class ThreadedTunableConfig:
         d["sync_strategy"] = self.sync_strategy.value
         return d
 
-    def save(self, path: str, metadata: dict = None):
-        """Save config to JSON file (e.g., results/best_write_config.json)."""
-        d = self.to_dict()
-        if metadata:
-            d["_metadata"] = metadata
-        with open(path, 'w') as f:
-            json.dump(d, f, indent=2)
-
     @classmethod
-    def load(cls, path: str) -> "ThreadedTunableConfig":
-        """Load config from JSON file, converting strings back to enums."""
-        with open(path) as f:
-            d = json.load(f)
+    def from_dict(cls, d: dict) -> "ThreadedTunableConfig":
+        """Create config from a dict, converting strings to enums."""
         return cls(
             thread_count=d.get("thread_count", 0),
+            block_size_mb=d.get("block_size_mb", 0),
             o_noatime=d.get("o_noatime", False),
             o_direct=d.get("o_direct", False),
             fadvise_hint=FadviseHint(d.get("fadvise_hint", "normal")),
@@ -68,6 +60,39 @@ class ThreadedTunableConfig:
             sync_strategy=SyncStrategy(d.get("sync_strategy", "none")),
             cpu_affinity=d.get("cpu_affinity", False),
         )
+
+
+def save_tunable_configs(path: str, write_config: ThreadedTunableConfig,
+                          read_config: ThreadedTunableConfig,
+                          concurrent_config: ThreadedTunableConfig,
+                          metadata: dict = None):
+    """Save all three best configs (write, read, concurrent) to a single JSON file."""
+    d = {
+        "write": write_config.to_dict(),
+        "read": read_config.to_dict(),
+        "concurrent": concurrent_config.to_dict(),
+    }
+    if metadata:
+        d["_metadata"] = metadata
+    with open(path, 'w') as f:
+        json.dump(d, f, indent=2)
+
+
+def load_tunable_configs(path: str) -> dict:
+    """Load all three configs from a multi-mode JSON file.
+
+    Returns dict with keys 'write', 'read', 'concurrent',
+    each containing a ThreadedTunableConfig.
+    Also returns '_metadata' if present.
+    """
+    with open(path) as f:
+        d = json.load(f)
+    configs = {}
+    for mode in ("write", "read", "concurrent"):
+        if mode in d:
+            configs[mode] = ThreadedTunableConfig.from_dict(d[mode])
+    configs["_metadata"] = d.get("_metadata", {})
+    return configs
 
 
 def configure(config: ThreadedTunableConfig):

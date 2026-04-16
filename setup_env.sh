@@ -22,7 +22,7 @@ echo "--- Upgrading pip ---" | tee -a $LOG_FILE
 pip install --no-cache-dir --upgrade pip 2>&1 | tee -a $LOG_FILE
 
 echo "--- Installing dependencies ---" | tee -a $LOG_FILE
-pip install --no-cache-dir torch aiofiles matplotlib ninja numpy 2>&1 | tee -a $LOG_FILE
+pip install --no-cache-dir torch aiofiles matplotlib ninja numpy optuna 2>&1 | tee -a $LOG_FILE
 
 echo "--- Building C++ extension ---" | tee -a $LOG_FILE
 python setup.py build_ext --inplace 2>&1 | tee -a $LOG_FILE
