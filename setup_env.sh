@@ -22,10 +22,13 @@ echo "--- Upgrading pip ---" | tee -a $LOG_FILE
 pip install --no-cache-dir --upgrade pip 2>&1 | tee -a $LOG_FILE
 
 echo "--- Installing dependencies ---" | tee -a $LOG_FILE
-pip install --no-cache-dir torch aiofiles matplotlib ninja numpy 2>&1 | tee -a $LOG_FILE
+pip install --no-cache-dir torch aiofiles matplotlib ninja numpy optuna 2>&1 | tee -a $LOG_FILE
 
 echo "--- Building C++ extension ---" | tee -a $LOG_FILE
 python setup.py build_ext --inplace 2>&1 | tee -a $LOG_FILE
+
+echo "--- Building threaded_tunable extension ---" | tee -a $LOG_FILE
+python setup_threaded_tunable.py build_ext --inplace 2>&1 | tee -a $LOG_FILE
 
 # --- liburing (skip if already installed) ---
 if [ -f "$HOME/.local/lib/liburing.so" ]; then
@@ -47,5 +50,5 @@ echo "--- Creating benchmark storage dir ---" | tee -a $LOG_FILE
 mkdir -p $STORAGE_PATH
 
 echo "=== Setup finished at $(date) ===" | tee -a $LOG_FILE
-echo "Verify with: source .venv/bin/activate && python -c \"import cpp_ext; print('OK'); import iouring_ext; print('OK')\""
+echo "Verify with: source .venv/bin/activate && python -c \"import cpp_ext; print('cpp OK'); import threaded_tunable_ext; print('tunable OK'); import iouring_ext; print('iouring OK')\""
 echo "Full log saved to: $LOG_FILE"

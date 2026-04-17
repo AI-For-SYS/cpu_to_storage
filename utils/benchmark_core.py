@@ -15,8 +15,40 @@ try:
 except ImportError:
     NIXL_AVAILABLE = False
     print("Warning: nixl backend not available (nixl package not installed). Skipping nixl support.")
+try:
+    from backends.threaded_tunable_backend import (
+        threaded_tunable_write_blocks, threaded_tunable_read_blocks,
+        configure as threaded_tunable_configure, THREADED_TUNABLE_AVAILABLE
+    )
+except ImportError:
+    THREADED_TUNABLE_AVAILABLE = False
+    print("Warning: threaded_tunable backend not available. Run 'python setup_threaded_tunable.py build_ext --inplace' to build it.")
 from utils.file_utils import verify_op
 import time
+
+# Holds loaded tunable configs per mode (set by load_tunable_configs, used by setup/apply)
+_tunable_configs = None  # dict with 'write', 'read', 'concurrent' keys
+_tunable_metadata = None
+
+def load_tunable_config(config_path):
+    """Load multi-mode tunable configs from JSON."""
+    global _tunable_configs, _tunable_metadata
+    from backends.threaded_tunable_backend import load_tunable_configs
+    result = load_tunable_configs(config_path)
+    _tunable_metadata = result.pop("_metadata", {})
+    _tunable_configs = result
+    print(f"Loaded tunable configs from {config_path}")
+    for mode, cfg in _tunable_configs.items():
+        print(f"  {mode}: thread_count={cfg.thread_count}, fadvise={cfg.fadvise_hint.value}, "
+              f"chunk={cfg.io_chunk_kb}KB, o_direct={cfg.o_direct}, "
+              f"sync={cfg.sync_strategy.value}")
+
+def get_tunable_config(mode):
+    """Get the tunable config for a specific mode, or default if not loaded."""
+    from backends.threaded_tunable_backend import ThreadedTunableConfig
+    if _tunable_configs and mode in _tunable_configs:
+        return _tunable_configs[mode]
+    return ThreadedTunableConfig()
 
 def create_benchmark_config(buffer_size, iterations, threads_counts, block_sizes_mb, implementation, **kwargs):
     """Create configuration dictionary for benchmark."""
@@ -64,6 +96,14 @@ def setup_executor(implementation, num_threads):
     """Setup thread pool executor for the given implementation."""
     if implementation == "cpp":
         set_thread_count_cpp(num_threads)
+        return None
+    elif implementation == "threaded_tunable":
+        # Config is applied per-operation in run_benchmark_iteration
+        # (write config for writes, read config for reads)
+        # If no tunable config loaded, use default with the given thread count
+        if _tunable_configs is None:
+            from backends.threaded_tunable_backend import ThreadedTunableConfig
+            threaded_tunable_configure(ThreadedTunableConfig(thread_count=num_threads))
         return None
     else:
         loop = asyncio.get_running_loop()
@@ -115,15 +155,32 @@ async def run_benchmark_iteration(
     if implementation == "cpp":
         time_write = await cpp_write_blocks(block_size, buffer, blocks_indices_write, file_names)
         verify_op(block_size, blocks_indices_write, view, file_names, "Writing", verify)
-        
+
         # reading 100GB of other blocks to clean the cache
         await cpp_read_blocks(block_size_cleaning, buffer_cleaning, indices_cleaning, file_names_cleaning)
 
         time_read = await cpp_read_blocks(block_size, buffer, blocks_indices_read, file_names)
         verify_op(block_size, blocks_indices_read, view, file_names, "Reading", verify)
-        
+
         # reading 100GB of other blocks to clean the cache
         await cpp_read_blocks(block_size_cleaning, buffer_cleaning, indices_cleaning, file_names_cleaning)
+
+    elif implementation == "threaded_tunable":
+        # Apply write config
+        threaded_tunable_configure(get_tunable_config("write"))
+
+        time_write = await threaded_tunable_write_blocks(block_size, buffer, blocks_indices_write, file_names)
+        verify_op(block_size, blocks_indices_write, view, file_names, "Writing", verify)
+
+        await threaded_tunable_read_blocks(block_size_cleaning, buffer_cleaning, indices_cleaning, file_names_cleaning)
+
+        # Switch to read config
+        threaded_tunable_configure(get_tunable_config("read"))
+
+        time_read = await threaded_tunable_read_blocks(block_size, buffer, blocks_indices_read, file_names)
+        verify_op(block_size, blocks_indices_read, view, file_names, "Reading", verify)
+
+        await threaded_tunable_read_blocks(block_size_cleaning, buffer_cleaning, indices_cleaning, file_names_cleaning)
 
     elif implementation == "python_aiofiles":
         time_write = await aiofiles_write_blocks(block_size, view, blocks_indices_write, file_names)
@@ -175,6 +232,28 @@ async def run_benchmark_iteration(
     return time_write, time_read
 
 
+async def run_tunable_write(block_size, buffer, blocks_indices, file_names,
+                             buffer_cleaning, file_names_cleaning, indices_cleaning,
+                             block_size_cleaning, view, verify):
+    """Run a single tunable write pass with the write config applied."""
+    threaded_tunable_configure(get_tunable_config("write"))
+    time_write = await threaded_tunable_write_blocks(block_size, buffer, blocks_indices, file_names)
+    verify_op(block_size, blocks_indices, view, file_names, "Writing", verify)
+    await threaded_tunable_read_blocks(block_size_cleaning, buffer_cleaning, indices_cleaning, file_names_cleaning)
+    return time_write
+
+
+async def run_tunable_read(block_size, buffer, blocks_indices, file_names,
+                            buffer_cleaning, file_names_cleaning, indices_cleaning,
+                            block_size_cleaning, view, verify):
+    """Run a single tunable read pass with the read config applied."""
+    threaded_tunable_configure(get_tunable_config("read"))
+    time_read = await threaded_tunable_read_blocks(block_size, buffer, blocks_indices, file_names)
+    verify_op(block_size, blocks_indices, view, file_names, "Reading", verify)
+    await threaded_tunable_read_blocks(block_size_cleaning, buffer_cleaning, indices_cleaning, file_names_cleaning)
+    return time_read
+
+
 async def run_concurrent_benchmark_iteration(
     implementation, block_size, buffer, buffer_cleaning, view, view_cleaning,
     blocks_indices_write, blocks_indices_read, file_names_write, file_names_read,
@@ -185,6 +264,8 @@ async def run_concurrent_benchmark_iteration(
     # Clean cache before concurrent operations
     if implementation == "cpp":
         await cpp_read_blocks(block_size_cleaning, buffer_cleaning, indices_cleaning, file_names_cleaning)
+    elif implementation == "threaded_tunable":
+        await threaded_tunable_read_blocks(block_size_cleaning, buffer_cleaning, indices_cleaning, file_names_cleaning)
     elif implementation == "nixl":
         reg_handler_cleaning = nixl_register_buffer(_get_read_agent(), buffer_cleaning)
         nixl_read_blocks(block_size_cleaning, buffer_cleaning, indices_cleaning, file_names_cleaning)
@@ -194,13 +275,20 @@ async def run_concurrent_benchmark_iteration(
 
     # Run concurrent read and write operations
     start_time = time.perf_counter()
-    
+
     if implementation == "cpp":
         # Run both operations concurrently
         write_task = cpp_write_blocks(block_size, buffer, blocks_indices_write, file_names_write)
         read_task = cpp_read_blocks(block_size, buffer, blocks_indices_read, file_names_read)
         time_write, time_read = await asyncio.gather(write_task, read_task)
-        
+
+    elif implementation == "threaded_tunable":
+        # Apply concurrent config for simultaneous read+write
+        threaded_tunable_configure(get_tunable_config("concurrent"))
+        write_task = threaded_tunable_write_blocks(block_size, buffer, blocks_indices_write, file_names_write)
+        read_task = threaded_tunable_read_blocks(block_size, buffer, blocks_indices_read, file_names_read)
+        time_write, time_read = await asyncio.gather(write_task, read_task)
+
     elif implementation == "python_aiofiles":
         write_task = aiofiles_write_blocks(block_size, view, blocks_indices_write, file_names_write)
         read_task = aiofiles_read_blocks(block_size, view, blocks_indices_read, file_names_read)
@@ -233,6 +321,8 @@ async def run_concurrent_benchmark_iteration(
     # Clean cache after concurrent operations
     if implementation == "cpp":
         await cpp_read_blocks(block_size_cleaning, buffer_cleaning, indices_cleaning, file_names_cleaning)
+    elif implementation == "threaded_tunable":
+        await threaded_tunable_read_blocks(block_size_cleaning, buffer_cleaning, indices_cleaning, file_names_cleaning)
     elif implementation == "nixl":
         reg_handler_cleaning = nixl_register_buffer(_get_read_agent(), buffer_cleaning)
         nixl_read_blocks(block_size_cleaning, buffer_cleaning, indices_cleaning, file_names_cleaning)

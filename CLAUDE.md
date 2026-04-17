@@ -26,6 +26,7 @@
 
 ## Code Changes
 - Do not modify code without the user's explicit approval. Always show proposed changes first and wait for confirmation before applying.
+- When proposing changes, describe briefly what you plan to do (files to create/modify, key design points). Do not dump full code listings. The user will ask for more details if needed.
 
 ## Git Commits
 - Do not add "Co-Authored-By" lines to commit messages.
