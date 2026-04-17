@@ -17,20 +17,24 @@ The suite compares file I/O throughput (read/write) across multiple implementati
 
 ```
 compare_file_operations.py    Entry point. Parses CLI args, dispatches to benchmark mode.
-        |
+        |                     Includes tunable_benchmark() for optimized threaded_tunable runs.
         v
 utils/benchmark_core.py       Core engine. Allocates buffers, runs iterations, dispatches to backends.
+        |                     Supports per-operation config switching for threaded_tunable.
         |
-        +---> backends/cpp_backend.py          -> cpp_ext (C++ PyBind11 module)
-        +---> backends/python_self_backend.py  -> asyncio + os.readv/os.write
-        +---> backends/aiofiles_backend.py     -> aiofiles library
-        +---> backends/nixl_backend.py         -> NVIDIA NIXL library
+        +---> backends/cpp_backend.py              -> cpp_ext (C++ PyBind11 module)
+        +---> backends/threaded_tunable_backend.py  -> threaded_tunable_ext (tunable C++ module)
+        +---> backends/python_self_backend.py       -> asyncio + os.readv/os.write
+        +---> backends/aiofiles_backend.py          -> aiofiles library
+        +---> backends/nixl_backend.py              -> NVIDIA NIXL library
         |
         v
-utils/file_utils.py            File naming, verification, cleanup
+utils/file_utils.py            File naming, verification, cleanup (safe: only deletes files it created)
 utils/checkpoints_utils.py     Incremental save/resume of results
 utils/config.py                Environment variables (STORAGE_PATH, CLUSTER_NAME)
-plotter.py                     Matplotlib visualization of results
+plotter.py                     Matplotlib visualization of results (grid-based backends)
+plot_comparison.py             Bar chart comparison: CPP best vs CPP @same-block vs Tunable
+optuna_tuner.py                Optuna auto-tuner: finds best thread_count + block_size per mode
 ```
 
 ---
@@ -43,7 +47,9 @@ cpu_to_storage/
 ├── setup.py                       # Builds C++ extension (cpp_ext) via PyTorch CppExtension
 ├── setup_threaded_tunable.py      # Builds threaded_tunable extension (threaded_tunable_ext)
 ├── setup_iouring.py               # Builds io_uring extension (iouring_ext), links liburing
-├── plotter.py                     # Result visualization (multiple plot types)
+├── optuna_tuner.py                # Optuna auto-tuner (3 studies: write, read, concurrent)
+├── plotter.py                     # Result visualization (grid-based backends)
+├── plot_comparison.py             # Bar chart: CPP best vs CPP @block vs Tunable
 ├── copy_to_pod.sh                 # kubectl copy helper for K8s deployment
 ├── setup_env.sh                   # Idempotent venv + deps + extensions setup (safe to re-run)
 ├── run_benchmark_on_lsf.sh        # LSF job submission wrapper
@@ -82,6 +88,13 @@ cpu_to_storage/
 ├── tests/
 │   ├── test_iouring.py            # Quick smoke test for iouring_ext
 │   └── test_threaded_tunable.py   # Smoke test: build, config roundtrip, each knob, baseline comparison
+├── skills/
+│   └── experiment/                # Skill for writing structured experiment reports
+│       ├── SKILL.md               # Skill definition and workflow
+│       └── report-template.md     # 9-section experiment report template
+├── scripts/
+│   ├── run_optuna_on_lsf.sh       # LSF submission wrapper for Optuna
+│   └── optuna_job.sh              # Optuna job script (venv, run tuner)
 ├── docs/
 │   ├── optuna_autotuning_plan.md  # Design plan for Optuna + threaded_tunable
 │   └── ...                        # Presentation files
@@ -230,7 +243,7 @@ cpu_to_storage/
 
 | Argument | Default | Description |
 |----------|---------|-------------|
-| `--mode` | `blocks` | `blocks`, `data`, or `concurrent` |
+| `--mode` | `data` | `data` (default, fixed total GB), `blocks` (fixed block count), or `concurrent` |
 | `--backend` | `python_self_imp` | `cpp`, `threaded_tunable`, `python_aiofiles`, `python_self_imp`, `nixl` |
 | `--tunable-config` | `None` | Path to JSON config for `threaded_tunable` backend |
 | `--buffer-size` | `100` | Buffer size in GB |
@@ -269,6 +282,56 @@ Five plot functions, dispatched by mode via `main()`:
 
 Usage: `python plotter.py <mode> <file1> [file2] ...`
 
+### Comparison Plotter (`plot_comparison.py`)
+
+Bar chart comparing CPP best vs CPP at same block size vs Tunable for write, read, and concurrent:
+
+Usage: `python plot_comparison.py <cpp_data.json> <tunable_data.json> [cpp_concurrent.json]`
+
+When CPP doesn't have the exact block size as tunable, uses the closest available and labels it.
+
+---
+
+## Optuna Auto-Tuner (`optuna_tuner.py`)
+
+Bayesian optimization to find best `thread_count` and `block_size_mb` per I/O operation mode.
+
+### Architecture
+- Runs 3 sequential studies: write, read, concurrent
+- Each study optimizes throughput (GB/s) independently
+- Exports single JSON with best config per mode
+- SQLite storage for checkpoint/resume across LSF jobs
+
+### Presets
+
+| Preset | Trials/mode | Data/trial | Buffer | Iterations | Purpose |
+|--------|------------|-----------|--------|------------|---------|
+| `short` | 20 | 1GB | 1GB | 1 | Quick wiring check (~6 min) |
+| `full` | 200 | 10GB | 100GB | 3 | Real optimization (~5 hours) |
+
+### Explored Parameters (current)
+- `thread_count`: int [4, 128] — continuous range vs cpp's fixed [16, 32, 64]
+- `block_size_mb`: categorical [2, 4, 8, 16, 32, 64, 128] — includes 128MB which cpp never tests
+
+### Frozen Parameters
+All I/O-level parameters frozen to match cpp defaults (based on experiment findings):
+`io_chunk_kb=0, fadvise_hint=normal, o_direct=false, o_noatime=false, prefetch_depth=0, fallocate=false, sync_strategy=none, cpu_affinity=false`
+
+### Key Findings (from experiments on GPFS)
+- POSIX I/O hints (fadvise, chunking, O_DIRECT) provide no benefit on GPFS
+- `fadvise=noreuse` is harmful — destroys read throughput
+- Thread count optimality is data-size dependent (10GB vs 30GB need different counts)
+- 128MB blocks improve concurrent throughput by ~50% over cpp's max 64MB
+- Block size selection is robust across data scales
+
+### Usage
+```bash
+python optuna_tuner.py --preset short    # quick test
+python optuna_tuner.py                   # full optimization
+./scripts/run_optuna_on_lsf.sh           # via LSF
+./scripts/run_optuna_on_lsf.sh short     # quick via LSF
+```
+
 ---
 
 ## Kubernetes Deployment
@@ -305,7 +368,8 @@ Usage: `python plotter.py <mode> <file1> [file2] ...`
    - `./run_benchmark_on_lsf.sh short threaded_tunable` — run single backend.
    - `./run_benchmark_on_lsf.sh compare-short` — run all backends on same node for fair comparison (short).
    - `./run_benchmark_on_lsf.sh compare-short "cpp threaded_tunable"` — compare selected backends only.
-   - `./run_benchmark_on_lsf.sh compare-full "cpp threaded_tunable" results/best_write_config.json` — full comparison with tunable config.
+   - `./run_benchmark_on_lsf.sh compare-full "cpp threaded_tunable" results/best_config.json` — full comparison with tunable config (data mode, 30GB, 5 iter).
+   - Compare modes use `--mode data` for fair comparison (same total data for all block sizes).
 4. Monitor: `bjobs`, `bpeek <job_id>`
 5. Results: `logs/benchmark_<job_id>.out` and `results/` directory
 
@@ -325,7 +389,8 @@ Usage: `python plotter.py <mode> <file1> [file2] ...`
 
 ## Key Design Decisions & Patterns
 
-1. **Atomic writes everywhere**: All backends write to temp file then rename. Prevents partial/corrupt files.
+1. **Safe file cleanup**: All benchmark files cleaned via Python `clean_files()` which only deletes files it created. No `rm -f` commands.
+2. **Atomic writes everywhere**: All backends write to temp file then rename. Prevents partial/corrupt files.
 2. **Serialized file creation in C++**: Main thread opens all temp files sequentially before dispatching workers. Avoids directory inode contention from concurrent `O_CREAT`.
 3. **Parallel FD opens for reads in C++**: Since files already exist, no `O_CREAT` contention, so opening in workers is faster.
 4. **Cache invalidation between phases**: Reads 100GB unrelated data to flush OS page cache. Critical for measuring true I/O throughput, not cached reads.
@@ -386,4 +451,14 @@ Usage: `python plotter.py <mode> <file1> [file2] ...`
 }
 ```
 
-Values are **mean elapsed time in seconds** across all iterations for that (thread_count, block_size_mb) combination.
+Values in `write`/`read`/`concurrent` sections are **mean elapsed time in seconds** across all iterations.
+
+Results also include throughput sections for readability:
+```json
+{
+  "write_throughput_gbs": { "16": { "2": 0.29, "4": 0.42, ... } },
+  "read_throughput_gbs":  { "16": { "2": 0.57, "4": 0.88, ... } }
+}
+```
+
+Output filenames include timestamps: `data_io_throughput_30.0gb_storage_cpp_20260415_172234.json`

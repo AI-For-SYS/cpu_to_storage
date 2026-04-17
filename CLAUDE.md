@@ -12,7 +12,7 @@
 - This is a Linux-targeted I/O benchmarking project. The C++ backend and python_self_backend use POSIX-only APIs.
 - The goal is to improve I/O throughput times through algorithm evolution and experimentation.
 - Kubernetes deployment is optional; the benchmarks can run on any Linux machine with sufficient RAM.
-- The C++ extension is built via `python setup.py build_ext --inplace`.
+- The C++ extensions are built via `python setup.py build_ext --inplace` (cpp_ext) and `python setup_threaded_tunable.py build_ext --inplace` (threaded_tunable_ext).
 
 ## Code Style
 - Backends expose async functions: `{name}_read_blocks(block_size, buffer, block_indices, dest_files) -> float` and `{name}_write_blocks(...)` returning elapsed seconds.
