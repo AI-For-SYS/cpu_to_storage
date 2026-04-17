@@ -88,6 +88,10 @@ cpu_to_storage/
 ├── tests/
 │   ├── test_iouring.py            # Quick smoke test for iouring_ext
 │   └── test_threaded_tunable.py   # Smoke test: build, config roundtrip, each knob, baseline comparison
+├── skills/
+│   └── experiment/                # Skill for writing structured experiment reports
+│       ├── SKILL.md               # Skill definition and workflow
+│       └── report-template.md     # 9-section experiment report template
 ├── scripts/
 │   ├── run_optuna_on_lsf.sh       # LSF submission wrapper for Optuna
 │   └── optuna_job.sh              # Optuna job script (venv, run tuner)
