@@ -660,7 +660,7 @@ results/best_config_{timestamp}.json
   },
   "_metadata": {
     "storage_path": "/mnt/storage",
-    "total_trials_per_mode": 60,
+    "total_trials_per_mode": 200,
     "write_best_throughput_gbs": 14.31,
     "write_best_trial": 29,
     "read_best_throughput_gbs": 58.63,
@@ -707,13 +707,15 @@ No `--mode` flag — the tuner always runs all three studies (write, read, concu
 | Preset | Trials per mode | Timeout per mode | Data/trial | Buffer | Iterations | Purpose |
 |--------|----------------|-----------------|-----------|--------|------------|---------|
 | `short` | 20 | 300s | 1GB | 1GB | 1 | Verify Optuna wiring works |
-| `full` | 60 | none | 10GB | 100GB | 3 | Real optimization run |
+| `full` | 200 | none | 10GB | 100GB | 3 | Real optimization run |
 
-Total time: `short` ~6 min, `full` ~1.5 hours (all three modes at ~26s/trial).
+Total time: `short` ~6 min, `full` ~4–5 hours (depends on storage; on GPFS ~5 hours across all three modes).
 
-**Explored parameters (4):** `thread_count`, `block_size_mb`, `io_chunk_kb`, `fadvise_hint`
+**Explored parameters (2):** `thread_count` (int [4, 128], log-scale), `block_size_mb` (categorical)
+- `short` preset block sizes: `[4, 8, 16, 32]`
+- `full` preset block sizes: `[2, 4, 8, 16, 32, 64, 128]`
 
-**Frozen parameters (6):** `o_direct=off`, `cpu_affinity=off`, `o_noatime=true`, `prefetch_depth=0`, `fallocate=off`, `sync_strategy=none`
+**Frozen parameters (8):** `io_chunk_kb=0`, `fadvise_hint=normal`, `o_direct=false`, `o_noatime=false`, `prefetch_depth=0`, `fallocate=false`, `sync_strategy=none`, `cpu_affinity=false` — all match cpp defaults. Experiments on GPFS showed these hints provide no throughput benefit; freezing them shrinks the search space so Optuna can converge faster on the two params that matter.
 
 **CLI arguments:**
 
@@ -849,7 +851,7 @@ Same format as section 6.5. `block_size_mb` is part of each mode's config, not m
 **Full workflow (first time on a system):**
 ```
 1. Optimize:    python optuna_tuner.py
-               → runs write, read, concurrent studies (60 trials each, ~1.5 hours)
+               → runs write, read, concurrent studies (200 trials each, ~4–5 hours)
                → saves results/best_config_{timestamp}.json
 
 2. Benchmark:   ./run_benchmark_on_lsf.sh compare-full "cpp threaded_tunable" results/best_config.json
