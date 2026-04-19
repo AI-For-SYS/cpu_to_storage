@@ -44,13 +44,13 @@ PRESETS = {
         "n_startup_trials": 5,
     },
     "full": {
-        "n_trials": 200,
+        "n_trials": 250,
         "timeout_per_mode": None,
         "data_gb": 10,
         "buffer_gb": 100,
         "iterations": 3,
         "block_sizes_mb": [2, 4, 8, 16, 32, 64, 128],
-        "n_startup_trials": 20,
+        "n_startup_trials": 30,
     },
 }
 
