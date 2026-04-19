@@ -345,8 +345,8 @@ def print_study_summary(study, mode):
         print(f"\n  Parameter importance (fANOVA):")
         for i, (param, imp) in enumerate(importance.items(), 1):
             print(f"    {i}. {param:20s} {imp:.1%}")
-    except Exception:
-        print(f"  Parameter importance: not enough trials for fANOVA")
+    except Exception as e:
+        print(f"  Parameter importance unavailable ({type(e).__name__}): {e}")
 
 
 def extract_best_config(study):
