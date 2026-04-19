@@ -4,7 +4,7 @@ import asyncio
 from concurrent.futures import ThreadPoolExecutor
 from utils.checkpoints_utils import save_incremental_results, load_existing_results, check_config_match, get_completed_tests
 from backends.cpp_backend import set_thread_count_cpp
-from utils.config import PYTHON_BACKENDS, CLUSTER, STORAGE_PATH
+from utils.config import PYTHON_BACKENDS, CLUSTER, STORAGE_PATH, PIN_MEMORY
 import torch
 from backends.cpp_backend import cpp_write_blocks, cpp_read_blocks
 from backends.aiofiles_backend import aiofiles_write_blocks, aiofiles_read_blocks
@@ -339,11 +339,11 @@ def allocate_buffers(buffer_size, verify=False):
     print("Allocating buffers...")
     
     if verify:
-        buffer = torch.randn(num_elements, dtype=torch.float16, device='cpu', pin_memory=True)
+        buffer = torch.randn(num_elements, dtype=torch.float16, device='cpu', pin_memory=PIN_MEMORY)
     else:
-        buffer = torch.zeros(num_elements, dtype=torch.float16, device='cpu', pin_memory=True)
-    
-    buffer_cleaning = torch.zeros(50*1024*1024*1024, dtype=torch.float16, device='cpu', pin_memory=True)
+        buffer = torch.zeros(num_elements, dtype=torch.float16, device='cpu', pin_memory=PIN_MEMORY)
+
+    buffer_cleaning = torch.zeros(50*1024*1024*1024, dtype=torch.float16, device='cpu', pin_memory=PIN_MEMORY)
     
     print("Buffers allocated\n")
     

@@ -27,7 +27,7 @@ from backends.threaded_tunable_backend import (
     configure, threaded_tunable_write_blocks, threaded_tunable_read_blocks,
     save_tunable_configs,
 )
-from utils.config import STORAGE_PATH
+from utils.config import STORAGE_PATH, PIN_MEMORY
 from utils.file_utils import generate_dest_file_names, clean_files
 
 # ============================================================================
@@ -44,13 +44,13 @@ PRESETS = {
         "n_startup_trials": 5,
     },
     "full": {
-        "n_trials": 200,
+        "n_trials": 250,
         "timeout_per_mode": None,
         "data_gb": 10,
         "buffer_gb": 100,
         "iterations": 3,
         "block_sizes_mb": [2, 4, 8, 16, 32, 64, 128],
-        "n_startup_trials": 20,
+        "n_startup_trials": 30,
     },
 }
 
@@ -73,7 +73,7 @@ def allocate_trial_buffers(buffer_gb):
     num_elements = buffer_size // 2  # float16 = 2 bytes
 
     print("Allocating buffers...")
-    _buffer = torch.zeros(num_elements, dtype=torch.float16, device='cpu', pin_memory=True)
+    _buffer = torch.zeros(num_elements, dtype=torch.float16, device='cpu', pin_memory=PIN_MEMORY)
 
     # Cleaning buffer: must match original benchmark — 100GB
     # Original allocates 50B float16 elements = 100GB buffer, 3200 × 32MB files = 100GB reads
@@ -82,7 +82,7 @@ def allocate_trial_buffers(buffer_gb):
     num_cleaning_blocks = 3200               # 3200 × 32MB = 100GB
     cleaning_size = num_cleaning_blocks * _cleaning_block_size  # 100GB
     cleaning_elements = cleaning_size // 2   # float16 = 2 bytes
-    _buffer_cleaning = torch.zeros(cleaning_elements, dtype=torch.float16, device='cpu', pin_memory=True)
+    _buffer_cleaning = torch.zeros(cleaning_elements, dtype=torch.float16, device='cpu', pin_memory=PIN_MEMORY)
 
     _cleaning_files = [f"/dev/shm/cleaning_{j}.bin" for j in range(num_cleaning_blocks)]
     _cleaning_indices = list(range(num_cleaning_blocks))
@@ -345,8 +345,8 @@ def print_study_summary(study, mode):
         print(f"\n  Parameter importance (fANOVA):")
         for i, (param, imp) in enumerate(importance.items(), 1):
             print(f"    {i}. {param:20s} {imp:.1%}")
-    except Exception:
-        print(f"  Parameter importance: not enough trials for fANOVA")
+    except Exception as e:
+        print(f"  Parameter importance unavailable ({type(e).__name__}): {e}")
 
 
 def extract_best_config(study):
