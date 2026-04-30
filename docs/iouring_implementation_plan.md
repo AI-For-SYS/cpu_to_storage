@@ -307,9 +307,9 @@ io_uring manages its own concurrency (kernel-side), so like `cpp`, it returns `N
 2. ~~**Read path**: Implement `iouring_read_blocks()` in C++~~ **DONE**
 3. ~~**Build & smoke test**: Build on remote~~ **DONE** (builds OK, but io_uring blocked on cluster — see Blockers)
 4. ~~**Write path**: Implement `iouring_write_blocks()` with atomic temp-rename pattern~~ **DONE**
-5. **Integration**: Wire into `benchmark_core.py` and `compare_file_operations.py` — **NEXT**
-6. **Baseline comparison**: Run `iouring` vs `cpp` on `/dev/shm` with same parameters
-7. **Tuning knobs**: Add SQPOLL, O_DIRECT, registered files/buffers as toggleable options
+5. **Integration**: Wire into `benchmark_core.py` and `compare_file_operations.py` — **DONE (all three modes in benchmark_core)**. `run_benchmark_iteration` and `run_concurrent_benchmark_iteration` both have iouring branches. `compare_file_operations.py` still exposes `--mode data` only (guardrail remains until tunable-config wiring lands on the compare side).
+6. **Baseline comparison**: Run `iouring` vs `cpp` on `/dev/shm` with same parameters — **DONE** on real storage (`/home/yevgenyy/tmp_storage`), iouring ≈ 2.4 GB/s write, 3.9 GB/s read at queue_depth=256.
+7. **Tuning knobs**: Add SQPOLL, O_DIRECT, registered files/buffers as toggleable options — **IN PROGRESS**. Python-side `IouringTunableConfig` dataclass exposes all four as fields (frozen at False). `optuna_tuner_iouring.py` drives queue_depth / batch_size / block_size_mb searches; the four frozen knobs need C++ setters in `iouring_utils.cpp` before they can be unfrozen.
 8. **Real storage test**: Run on actual filesystem (Spectrum Scale / NFS / whatever the cluster has)
 
 ### Blockers

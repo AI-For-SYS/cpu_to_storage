@@ -10,11 +10,13 @@ from utils.file_utils import generate_dest_file_names, clean_files, write_blocks
 from utils.benchmark_core import (
     create_benchmark_config, load_or_create_results, setup_executor, allocate_buffers,
     shutdown_executor, print_benchmark_summary, run_benchmark_iteration,
-    run_concurrent_benchmark_iteration, setup_cleaning_files, load_tunable_config,
-    get_tunable_config
+    run_concurrent_benchmark_iteration, setup_cleaning_files,
+    load_threads_config, get_threads_config,
+    load_iouring_config, get_iouring_config,
 )
 from backends.cpp_backend import CPP_AVAILABLE
 from backends.threaded_tunable_backend import THREADED_TUNABLE_AVAILABLE
+from backends.iouring_backend import IOURING_AVAILABLE
 from utils.checkpoints_utils import save_incremental_results
 
 async def blocks_benchmark(num_blocks, iterations, buffer_size, implementation, test_name, block_sizes_mb, threads_counts, verify=False):
@@ -147,6 +149,10 @@ async def total_data_benchmark(total_gb, iterations, buffer_size, implementation
     if implementation=="threaded_tunable":
         if not THREADED_TUNABLE_AVAILABLE:
             print("threaded_tunable implementation not available.")
+            return
+    if implementation=="iouring":
+        if not IOURING_AVAILABLE:
+            print("iouring implementation not available.")
             return
 
     total_combinations = len(block_sizes_mb) * len(threads_counts)
@@ -413,36 +419,31 @@ async def concurrent_benchmark(total_gb, iterations, buffer_size, implementation
     return all_results
 
 
-async def tunable_benchmark(num_blocks, iterations, buffer_size, test_name, total_gb=None, verify=False):
-    """Benchmark threaded_tunable with separate best configs for write, read, and concurrent.
-
-    Runs three passes:
-    1. Write pass with write config
-    2. Read pass with read config
-    3. Concurrent pass with concurrent config (simultaneous write + read)
-
-    Args:
-        num_blocks: Fixed number of blocks per pass (blocks mode).
-                    Ignored if total_gb is set.
-        total_gb: Fixed total data in GB (data mode).
-                  When set, num_blocks is calculated per pass from total_gb / block_size_mb.
+async def _tunable_benchmark_impl(
+    num_blocks, iterations, buffer_size, test_name, total_gb, verify,
+    *,
+    backend_label,        # "threaded_tunable" | "iouring" — used in output filename + config dict
+    parallelism_attr,     # "thread_count" | "queue_depth" — cfg attribute for outer result key
+    available_flag,       # bool — caller's {BACKEND}_AVAILABLE
+    get_cfg,              # fn(mode) -> Config
+    backend_configure,    # fn(cfg) — applies config to extension
+    write_blocks_fn,      # async fn(block_size, buffer, indices, files)
+    read_blocks_fn,       # async fn(block_size, buffer, indices, files)
+    run_write_fn,         # async fn — one write pass w/ cache clean
+    run_read_fn,          # async fn — one read pass w/ cache clean
+):
+    """Shared tunable-benchmark body. Runs three passes (write/read/concurrent)
+    with per-mode configs loaded via get_cfg(). Backend-specific callables are
+    injected; this function contains no backend conditionals.
     """
-    from utils.benchmark_core import (
-        run_tunable_write, run_tunable_read, get_tunable_config,
-        threaded_tunable_configure
-    )
-    from backends.threaded_tunable_backend import (
-        threaded_tunable_write_blocks, threaded_tunable_read_blocks
-    )
-
     start_time = time.perf_counter()
 
-    if not THREADED_TUNABLE_AVAILABLE:
-        print("threaded_tunable implementation not available.")
+    if not available_flag:
+        print(f"{backend_label} implementation not available.")
         return
 
-    write_cfg = get_tunable_config("write")
-    read_cfg = get_tunable_config("read")
+    write_cfg = get_cfg("write")
+    read_cfg = get_cfg("read")
     write_block_mb = write_cfg.block_size_mb or 32
     read_block_mb = read_cfg.block_size_mb or 8
 
@@ -450,9 +451,9 @@ async def tunable_benchmark(num_blocks, iterations, buffer_size, test_name, tota
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
 
     if total_gb is not None:
-        output_file = f'results/data_{test_name}_{total_gb}gb_{dest}_threaded_tunable_{ts}.json'
+        output_file = f'results/data_{test_name}_{total_gb}gb_{dest}_{backend_label}_{ts}.json'
     else:
-        output_file = f'results/blocks_{num_blocks}_{test_name}_{dest}_threaded_tunable_{ts}.json'
+        output_file = f'results/blocks_{num_blocks}_{test_name}_{dest}_{backend_label}_{ts}.json'
 
     # Calculate num_blocks per pass
     write_block_size = write_block_mb * 1024 * 1024
@@ -470,16 +471,19 @@ async def tunable_benchmark(num_blocks, iterations, buffer_size, test_name, tota
     write_total_gb = write_block_mb * write_num_blocks / 1024
     read_total_gb = read_block_mb * read_num_blocks / 1024
 
+    write_parallel = getattr(write_cfg, parallelism_attr)
+    read_parallel = getattr(read_cfg, parallelism_attr)
+
     config = create_benchmark_config(
         buffer_size, iterations,
-        threads_counts=[write_cfg.thread_count, read_cfg.thread_count],
+        threads_counts=[write_parallel, read_parallel],
         block_sizes_mb=[write_block_mb, read_block_mb],
-        implementation="threaded_tunable",
+        implementation=backend_label,
         total_data_size_gb=total_gb,
         num_blocks=num_blocks,
         tunable_write_config=write_cfg.to_dict(),
         tunable_read_config=read_cfg.to_dict(),
-        tunable_concurrent_config=get_tunable_config("concurrent").to_dict(),
+        tunable_concurrent_config=get_cfg("concurrent").to_dict(),
     )
 
     buffer, buffer_cleaning, view, view_cleaning = allocate_buffers(buffer_size, verify)
@@ -494,12 +498,12 @@ async def tunable_benchmark(num_blocks, iterations, buffer_size, test_name, tota
         print(f"  Note: capped write blocks to {write_num_blocks} (buffer={buffer_size//(1024**3)}GB, block={write_block_mb}MB)")
     file_names_write = generate_dest_file_names("final", write_num_blocks)
 
-    print(f"\n  Write pass: block={write_block_mb}MB, threads={write_cfg.thread_count}, blocks={write_num_blocks}, total={write_total_gb:.1f}GB")
+    print(f"\n  Write pass: block={write_block_mb}MB, {parallelism_attr}={write_parallel}, blocks={write_num_blocks}, total={write_total_gb:.1f}GB")
     times_write = []
     for i in range(iterations):
         clean_files(file_names_write)
         blocks_indices = random.sample(range(max_write_blocks), write_num_blocks)
-        tw = await run_tunable_write(
+        tw = await run_write_fn(
             write_block_size, buffer, blocks_indices, file_names_write,
             buffer_cleaning, file_names_cleaning, indices_cleaning,
             block_size_cleaning, view, verify
@@ -516,7 +520,7 @@ async def tunable_benchmark(num_blocks, iterations, buffer_size, test_name, tota
     write_throughput = write_total_gb / avg_write
     print(f"    Write: {avg_write*1000:.2f}ms ({write_throughput:.2f} GB/s)")
 
-    write_results[str(write_cfg.thread_count)] = {str(write_block_mb): avg_write}
+    write_results[str(write_parallel)] = {str(write_block_mb): avg_write}
 
     # Clean write files before starting read pass
     clean_files(file_names_write)
@@ -529,17 +533,17 @@ async def tunable_benchmark(num_blocks, iterations, buffer_size, test_name, tota
     # Write the files that we'll read (using read block size)
     clean_files(file_names_read)
     blocks_indices_read_setup = random.sample(range(max_read_blocks), read_num_blocks)
-    await run_tunable_write(
+    await run_write_fn(
         read_block_size, buffer, blocks_indices_read_setup, file_names_read,
         buffer_cleaning, file_names_cleaning, indices_cleaning,
         block_size_cleaning, view, False
     )
 
-    print(f"\n  Read pass: block={read_block_mb}MB, threads={read_cfg.thread_count}, blocks={read_num_blocks}, total={read_total_gb:.1f}GB")
+    print(f"\n  Read pass: block={read_block_mb}MB, {parallelism_attr}={read_parallel}, blocks={read_num_blocks}, total={read_total_gb:.1f}GB")
     times_read = []
     for i in range(iterations):
         blocks_indices = random.sample(range(max_read_blocks), read_num_blocks)
-        tr = await run_tunable_read(
+        tr = await run_read_fn(
             read_block_size, buffer, blocks_indices, file_names_read,
             buffer_cleaning, file_names_cleaning, indices_cleaning,
             block_size_cleaning, view, verify
@@ -556,14 +560,15 @@ async def tunable_benchmark(num_blocks, iterations, buffer_size, test_name, tota
     read_throughput = read_total_gb / avg_read
     print(f"    Read:  {avg_read*1000:.2f}ms ({read_throughput:.2f} GB/s)")
 
-    read_results[str(read_cfg.thread_count)] = {str(read_block_mb): avg_read}
+    read_results[str(read_parallel)] = {str(read_block_mb): avg_read}
 
     clean_files(file_names_write)
     clean_files(file_names_read)
 
     # --- Concurrent pass ---
-    concurrent_cfg = get_tunable_config("concurrent")
+    concurrent_cfg = get_cfg("concurrent")
     concurrent_block_mb = concurrent_cfg.block_size_mb or 32
+    concurrent_parallel = getattr(concurrent_cfg, parallelism_attr)
     concurrent_block_size = concurrent_block_mb * 1024 * 1024
     max_concurrent_blocks = buffer_size // concurrent_block_size
 
@@ -580,31 +585,31 @@ async def tunable_benchmark(num_blocks, iterations, buffer_size, test_name, tota
 
     # Pre-write read files for concurrent test
     read_indices_setup = random.sample(range(half_max, max_concurrent_blocks), concurrent_half_blocks)
-    threaded_tunable_configure(concurrent_cfg)
-    await threaded_tunable_write_blocks(
+    backend_configure(concurrent_cfg)
+    await write_blocks_fn(
         concurrent_block_size, buffer, read_indices_setup, file_names_cread
     )
 
-    print(f"\n  Concurrent pass: block={concurrent_block_mb}MB, threads={concurrent_cfg.thread_count}, "
+    print(f"\n  Concurrent pass: block={concurrent_block_mb}MB, {parallelism_attr}={concurrent_parallel}, "
           f"blocks={concurrent_half_blocks}×2, total={concurrent_total_gb:.1f}GB")
 
     concurrent_results = {}
     times_concurrent = []
     for i in range(iterations):
         # Clean cache before concurrent
-        await threaded_tunable_read_blocks(
+        await read_blocks_fn(
             block_size_cleaning, buffer_cleaning, indices_cleaning, file_names_cleaning
         )
         clean_files(file_names_cwrite)
 
         write_indices = random.sample(range(0, half_max), concurrent_half_blocks)
 
-        threaded_tunable_configure(concurrent_cfg)
+        backend_configure(concurrent_cfg)
         start_concurrent = time.perf_counter()
-        write_task = threaded_tunable_write_blocks(
+        write_task = write_blocks_fn(
             concurrent_block_size, buffer, write_indices, file_names_cwrite
         )
-        read_task = threaded_tunable_read_blocks(
+        read_task = read_blocks_fn(
             concurrent_block_size, buffer, read_indices_setup, file_names_cread
         )
         await asyncio.gather(write_task, read_task)
@@ -618,7 +623,7 @@ async def tunable_benchmark(num_blocks, iterations, buffer_size, test_name, tota
         avg_concurrent = statistics.mean(times_concurrent)
         concurrent_throughput = concurrent_total_gb / avg_concurrent
         print(f"    Concurrent: {avg_concurrent*1000:.2f}ms ({concurrent_throughput:.2f} GB/s)")
-        concurrent_results[str(concurrent_cfg.thread_count)] = {str(concurrent_block_mb): avg_concurrent}
+        concurrent_results[str(concurrent_parallel)] = {str(concurrent_block_mb): avg_concurrent}
 
     # Build throughput sections (GB/s) alongside raw time sections
     write_throughput_results = {}
@@ -652,9 +657,63 @@ async def tunable_benchmark(num_blocks, iterations, buffer_size, test_name, tota
     return all_results
 
 
-async def tunable_data_benchmark(total_gb, iterations, buffer_size, test_name, verify=False):
-    """Data mode wrapper: calculates num_blocks from total_gb and delegates to tunable_benchmark."""
-    return await tunable_benchmark(
+async def threads_tunable_benchmark(num_blocks, iterations, buffer_size, test_name, total_gb=None, verify=False):
+    """Tunable benchmark for threaded_tunable backend. Thin wrapper over _tunable_benchmark_impl."""
+    from utils.benchmark_core import (
+        get_threads_config, run_threads_write, run_threads_read,
+        threaded_tunable_configure,
+    )
+    from backends.threaded_tunable_backend import (
+        threaded_tunable_write_blocks, threaded_tunable_read_blocks,
+    )
+    return await _tunable_benchmark_impl(
+        num_blocks, iterations, buffer_size, test_name, total_gb, verify,
+        backend_label="threaded_tunable",
+        parallelism_attr="thread_count",
+        available_flag=THREADED_TUNABLE_AVAILABLE,
+        get_cfg=get_threads_config,
+        backend_configure=threaded_tunable_configure,
+        write_blocks_fn=threaded_tunable_write_blocks,
+        read_blocks_fn=threaded_tunable_read_blocks,
+        run_write_fn=run_threads_write,
+        run_read_fn=run_threads_read,
+    )
+
+
+async def threads_tunable_data_benchmark(total_gb, iterations, buffer_size, test_name, verify=False):
+    """Data mode wrapper for threaded_tunable tunable benchmark."""
+    return await threads_tunable_benchmark(
+        num_blocks=None, iterations=iterations, buffer_size=buffer_size,
+        test_name=test_name, total_gb=total_gb, verify=verify
+    )
+
+
+async def iouring_tunable_benchmark(num_blocks, iterations, buffer_size, test_name, total_gb=None, verify=False):
+    """Tunable benchmark for iouring backend. Thin wrapper over _tunable_benchmark_impl."""
+    from utils.benchmark_core import (
+        get_iouring_config, run_iouring_write, run_iouring_read,
+    )
+    from backends.iouring_backend import (
+        iouring_write_blocks, iouring_read_blocks,
+        configure as iouring_configure,
+    )
+    return await _tunable_benchmark_impl(
+        num_blocks, iterations, buffer_size, test_name, total_gb, verify,
+        backend_label="iouring",
+        parallelism_attr="queue_depth",
+        available_flag=IOURING_AVAILABLE,
+        get_cfg=get_iouring_config,
+        backend_configure=iouring_configure,
+        write_blocks_fn=iouring_write_blocks,
+        read_blocks_fn=iouring_read_blocks,
+        run_write_fn=run_iouring_write,
+        run_read_fn=run_iouring_read,
+    )
+
+
+async def iouring_tunable_data_benchmark(total_gb, iterations, buffer_size, test_name, verify=False):
+    """Data mode wrapper for iouring tunable benchmark."""
+    return await iouring_tunable_benchmark(
         num_blocks=None, iterations=iterations, buffer_size=buffer_size,
         test_name=test_name, total_gb=total_gb, verify=verify
     )
@@ -677,15 +736,21 @@ if __name__ == "__main__":
     parser.add_argument(
         '--backend',
         type=str,
-        choices=['cpp', 'python_aiofiles', 'python_self_imp', 'nixl', 'threaded_tunable'],
+        choices=['cpp', 'python_aiofiles', 'python_self_imp', 'nixl', 'threaded_tunable', 'iouring'],
         default='python_self_imp',
         help='I/O backend to benchmark (default: python_self_imp)'
     )
     parser.add_argument(
-        '--tunable-config',
+        '--threads-config',
         type=str,
         default=None,
-        help='Path to JSON config for threaded_tunable backend (e.g., results/best_write_config.json)'
+        help='Path to tuned config JSON for threaded_tunable backend (e.g., results/best_config.json)'
+    )
+    parser.add_argument(
+        '--iouring-config',
+        type=str,
+        default=None,
+        help='Path to tuned config JSON for iouring backend (e.g., results/best_iouring_config.json)'
     )
     parser.add_argument(
         '--buffer-size',
@@ -732,19 +797,43 @@ if __name__ == "__main__":
     )
     
     args = parser.parse_args()
-    
-    # Load tunable config if provided
-    tunable_config_loaded = False
-    if args.tunable_config:
+
+    # Load per-backend tunable config if provided. Only one of --threads-config or
+    # --iouring-config is accepted per run; each is validated against --backend.
+    threads_config_loaded = False
+    iouring_config_loaded = False
+
+    if args.threads_config and args.iouring_config:
+        print("Error: pass at most one of --threads-config or --iouring-config.")
+        raise SystemExit(2)
+
+    if args.threads_config:
         if args.backend != "threaded_tunable":
-            print("Warning: --tunable-config is only used with --backend threaded_tunable, ignoring")
+            print("Warning: --threads-config is only used with --backend threaded_tunable, ignoring")
         else:
-            load_tunable_config(args.tunable_config)
-            tunable_config_loaded = True
+            load_threads_config(args.threads_config)
+            threads_config_loaded = True
+
+    if args.iouring_config:
+        if args.backend != "iouring":
+            print("Warning: --iouring-config is only used with --backend iouring, ignoring")
+        else:
+            load_iouring_config(args.iouring_config)
+            iouring_config_loaded = True
 
     # Convert buffer size from GB to bytes
     buffer_size = args.buffer_size * 1024 * 1024 * 1024
     threads_counts = [16, 32, 64]
+
+    # iouring (without a tuned config): only data mode is wired for the sweep path.
+    # The tuned-config path (iouring_tunable_benchmark) handles all three modes.
+    if args.backend == 'iouring' and not iouring_config_loaded:
+        if args.mode != 'data':
+            print(f"Error: --backend iouring without --iouring-config currently supports --mode data only "
+                  f"(got --mode {args.mode}).")
+            raise SystemExit(2)
+        threads_counts = [256]
+        print("Note: iouring uses fixed queue_depth=256 (result key '256' is queue depth, not thread count)")
 
     print("="*80)
     print("I/O BENCHMARK CONFIGURATION")
@@ -758,20 +847,26 @@ if __name__ == "__main__":
     print(f"Cluster:         {CLUSTER}")
     print(f"Test_name:       {args.test_name}")
     print(f"Verify:          {args.verify}")
-    if tunable_config_loaded:
-        print(f"Tunable Config:  {args.tunable_config}")
-        write_cfg = get_tunable_config("write")
-        read_cfg = get_tunable_config("read")
+    if threads_config_loaded:
+        print(f"Threads Config:  {args.threads_config}")
+        write_cfg = get_threads_config("write")
+        read_cfg = get_threads_config("read")
         print(f"  Write: threads={write_cfg.thread_count}, block={write_cfg.block_size_mb}MB")
         print(f"  Read:  threads={read_cfg.thread_count}, block={read_cfg.block_size_mb}MB")
+    elif iouring_config_loaded:
+        print(f"iouring Config:  {args.iouring_config}")
+        write_cfg = get_iouring_config("write")
+        read_cfg = get_iouring_config("read")
+        print(f"  Write: queue_depth={write_cfg.queue_depth}, batch={write_cfg.batch_size}, block={write_cfg.block_size_mb}MB")
+        print(f"  Read:  queue_depth={read_cfg.queue_depth}, batch={read_cfg.batch_size}, block={read_cfg.block_size_mb}MB")
 
-    # Route tunable with loaded config to dedicated benchmark function
-    if tunable_config_loaded and args.mode == 'data':
+    # Route tunable runs (threads or iouring) to dedicated benchmark functions
+    if threads_config_loaded and args.mode == 'data':
         print(f"Total Data:      {args.total_gb} GB")
         print("="*80)
         print()
 
-        asyncio.run(tunable_data_benchmark(
+        asyncio.run(threads_tunable_data_benchmark(
             total_gb=args.total_gb,
             iterations=args.iterations,
             buffer_size=buffer_size,
@@ -779,12 +874,38 @@ if __name__ == "__main__":
             verify=args.verify
         ))
 
-    elif tunable_config_loaded and args.mode == 'blocks':
+    elif threads_config_loaded and args.mode == 'blocks':
         print(f"Num Blocks:      {args.num_blocks}")
         print("="*80)
         print()
 
-        asyncio.run(tunable_benchmark(
+        asyncio.run(threads_tunable_benchmark(
+            num_blocks=args.num_blocks,
+            iterations=args.iterations,
+            buffer_size=buffer_size,
+            test_name=args.test_name,
+            verify=args.verify
+        ))
+
+    elif iouring_config_loaded and args.mode == 'data':
+        print(f"Total Data:      {args.total_gb} GB")
+        print("="*80)
+        print()
+
+        asyncio.run(iouring_tunable_data_benchmark(
+            total_gb=args.total_gb,
+            iterations=args.iterations,
+            buffer_size=buffer_size,
+            test_name=args.test_name,
+            verify=args.verify
+        ))
+
+    elif iouring_config_loaded and args.mode == 'blocks':
+        print(f"Num Blocks:      {args.num_blocks}")
+        print("="*80)
+        print()
+
+        asyncio.run(iouring_tunable_benchmark(
             num_blocks=args.num_blocks,
             iterations=args.iterations,
             buffer_size=buffer_size,

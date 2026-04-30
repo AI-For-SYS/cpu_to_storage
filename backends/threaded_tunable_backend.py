@@ -62,7 +62,7 @@ class ThreadedTunableConfig:
         )
 
 
-def save_tunable_configs(path: str, write_config: ThreadedTunableConfig,
+def save_threads_configs(path: str, write_config: ThreadedTunableConfig,
                           read_config: ThreadedTunableConfig,
                           concurrent_config: ThreadedTunableConfig,
                           metadata: dict = None):
@@ -78,7 +78,7 @@ def save_tunable_configs(path: str, write_config: ThreadedTunableConfig,
         json.dump(d, f, indent=2)
 
 
-def load_tunable_configs(path: str) -> dict:
+def load_threads_configs(path: str) -> dict:
     """Load all three configs from a multi-mode JSON file.
 
     Returns dict with keys 'write', 'read', 'concurrent',
