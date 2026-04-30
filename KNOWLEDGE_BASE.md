@@ -17,7 +17,7 @@ The suite compares file I/O throughput (read/write) across multiple implementati
 
 ```
 compare_file_operations.py    Entry point. Parses CLI args, dispatches to benchmark mode.
-        |                     Includes tunable_benchmark() for optimized threaded_tunable runs.
+        |                     Includes threads_tunable_benchmark / iouring_tunable_benchmark for tuned runs.
         v
 utils/benchmark_core.py       Core engine. Allocates buffers, runs iterations, dispatches to backends.
         |                     Supports per-operation config switching for threaded_tunable.
@@ -34,7 +34,8 @@ utils/checkpoints_utils.py     Incremental save/resume of results
 utils/config.py                Environment variables (STORAGE_PATH, CLUSTER_NAME)
 plotter.py                     Matplotlib visualization of results (grid-based backends)
 plot_comparison.py             Bar chart comparison: CPP best vs CPP @same-block vs Tunable
-optuna_tuner.py                Optuna auto-tuner: finds best thread_count + block_size per mode
+optuna_tuner_threads.py  Optuna auto-tuner for threaded_tunable: best thread_count + block_size per mode
+optuna_tuner_iouring.py           Optuna auto-tuner for iouring: best queue_depth + batch_size + block_size per mode
 ```
 
 ---
@@ -47,7 +48,8 @@ cpu_to_storage/
 ├── setup.py                       # Builds C++ extension (cpp_ext) via PyTorch CppExtension
 ├── setup_threaded_tunable.py      # Builds threaded_tunable extension (threaded_tunable_ext)
 ├── setup_iouring.py               # Builds io_uring extension (iouring_ext), links liburing
-├── optuna_tuner.py                # Optuna auto-tuner (3 studies: write, read, concurrent)
+├── optuna_tuner_threads.py  # Optuna auto-tuner for threaded_tunable (3 studies)
+├── optuna_tuner_iouring.py           # Optuna auto-tuner for iouring (3 studies, separate SQLite DB)
 ├── plotter.py                     # Result visualization (grid-based backends)
 ├── plot_comparison.py             # Bar chart: CPP best vs CPP @block vs Tunable
 ├── copy_to_pod.sh                 # kubectl copy helper for K8s deployment
@@ -93,8 +95,10 @@ cpu_to_storage/
 │       ├── SKILL.md               # Skill definition and workflow
 │       └── report-template.md     # 9-section experiment report template
 ├── scripts/
-│   ├── run_optuna_on_lsf.sh       # LSF submission wrapper for Optuna
-│   └── optuna_job.sh              # Optuna job script (venv, run tuner)
+│   ├── run_optuna_threads_on_lsf.sh  # LSF wrapper for threaded_tunable tuner
+│   ├── optuna_threads_job.sh         # threaded_tunable job script (venv, run tuner)
+│   ├── analyze_optuna_threads.py     # fANOVA analysis for threaded_tunable studies
+│   └── run_optuna_iouring.sh         # Local (no-LSF) wrapper for iouring tuner
 ├── docs/
 │   ├── optuna_autotuning_plan.md  # Design plan for Optuna + threaded_tunable
 │   └── ...                        # Presentation files
@@ -147,7 +151,7 @@ cpu_to_storage/
 - **Configuration**: `IOConfig` struct with 9 tunable parameters, `configure_all(dict)` bulk setter, `get_config()` getter
 - **Tunable parameters**: `O_NOATIME`, `O_DIRECT`, `posix_fadvise` hints, `io_chunk_size`, `prefetch_depth` (readahead), `fallocate` pre-allocation, `sync_strategy` (none/fdatasync/sync_file_range), `cpu_affinity`
 - **Python config**: `ThreadedTunableConfig` dataclass with `FadviseHint`/`SyncStrategy` enums, `save()`/`load()` for JSON persistence to `results/`
-- **Config loading**: `compare_file_operations.py --tunable-config results/best_write_config.json` loads saved params before benchmarking
+- **Config loading**: `compare_file_operations.py --backend threaded_tunable --threads-config results/best_config.json` loads saved params before benchmarking (iouring parallel: `--backend iouring --iouring-config results/best_iouring_config.json`)
 - **Default behavior**: With all parameters at defaults, behaves identically to baseline `cpp`
 - **GIL**: Released via `py::gil_scoped_release` during all I/O operations
 - **Exposed functions**: `threaded_tunable_read_blocks()`, `threaded_tunable_write_blocks()`, `configure_all()`, `get_config()`, individual setters
@@ -170,7 +174,7 @@ cpu_to_storage/
 - **Write**: `aiofiles.open(wb)` + `f.write()`, then `aiofiles.os.replace()` for atomic rename
 - **Thread count**: Controlled by the executor set in `benchmark_core.setup_executor()`
 
-### io_uring Backend (`iouring_backend.py` + `benchmark_iouring_utils/`) — IN PROGRESS
+### io_uring Backend (`iouring_backend.py` + `benchmark_iouring_utils/`) — INTEGRATED (all modes)
 
 - **Platform**: Linux only, requires kernel 5.6+ with io_uring enabled (`kernel.io_uring_disabled = 0`)
 - **Build**: `python setup_iouring.py build_ext --inplace` (requires liburing at `$HOME/.local` or system-wide)
@@ -181,9 +185,10 @@ cpu_to_storage/
 - **Batch overflow**: When ops > queue_depth, submits in batches with interleaved completion reaping
 - **GIL**: Released via `py::gil_scoped_release` during all I/O operations
 - **Tunable parameters**: `queue_depth` (ring size), `batch_size` (SQEs per submit). Future: SQPOLL, O_DIRECT, registered files/buffers.
-- **Exposed functions**: `iouring_read_blocks()`, `iouring_write_blocks()`, `set_queue_depth()`, `set_batch_size()`
+- **Exposed functions**: `iouring_read_blocks()`, `iouring_write_blocks()`, `set_queue_depth()`, `set_batch_size()`, `configure(IouringTunableConfig)` (applies queue_depth + batch_size; other fields frozen)
+- **Python config**: `IouringTunableConfig` dataclass with 7 fields (queue_depth, batch_size, block_size_mb, use_sqpoll, use_direct, use_registered_files, use_registered_buffers), `save_iouring_tunable_configs()` / `load_iouring_tunable_configs()` for JSON persistence (mirrors threaded_tunable's pattern)
 - **Availability detection**: Runtime probe (`iouring_probe()`) at import time detects both missing extension (ImportError) and kernel-blocked io_uring (RuntimeError). Sets `IOURING_AVAILABLE = False` with warning.
-- **Status**: Code written, builds, and probe works. Not yet integrated into `benchmark_core.py` or `compare_file_operations.py` (step 5 in plan). Blocked on cluster io_uring access (`kernel.io_uring_disabled=2` on current LSF cluster). Needs a machine with sudo + kernel 5.6+ to enable io_uring.
+- **Status**: Integrated into `benchmark_core.py` for all three modes (write, read, concurrent). `compare_file_operations.py` currently exposes `--mode data` only (guardrail remains until compare-side tunable wiring lands). For Optuna tuning, `optuna_tuner_iouring.py` drives all three modes directly via the iouring branches in `run_benchmark_iteration` / `run_concurrent_benchmark_iteration` — no compare CLI involved. First-pass tunable surface: `queue_depth`, `batch_size`, `block_size_mb`; frozen at defaults: `use_sqpoll`, `use_direct`, `use_registered_files`, `use_registered_buffers` (C++ setters pending). Testing requires kernel 5.6+ with `kernel.io_uring_disabled=0` (`sudo sysctl -w` on `lsf-gpu4`; LSF compute nodes have it set to 2).
 - **Design**: Modular strategy functions (`open_files_for_read/write`, `submit_io_ops`, `reap_completions`, `rename_temp_files`) structured for future Bayesian auto-tuning and OpenEvolve code evolution.
 - **Full plan**: See `docs/iouring_implementation_plan.md`
 
@@ -244,8 +249,9 @@ cpu_to_storage/
 | Argument | Default | Description |
 |----------|---------|-------------|
 | `--mode` | `data` | `data` (default, fixed total GB), `blocks` (fixed block count), or `concurrent` |
-| `--backend` | `python_self_imp` | `cpp`, `threaded_tunable`, `python_aiofiles`, `python_self_imp`, `nixl` |
-| `--tunable-config` | `None` | Path to JSON config for `threaded_tunable` backend |
+| `--backend` | `python_self_imp` | `cpp`, `threaded_tunable`, `python_aiofiles`, `python_self_imp`, `nixl`, `iouring` (data mode only) |
+| `--threads-config` | `None` | Path to JSON config for `threaded_tunable` backend |
+| `--iouring-config` | `None` | Path to JSON config for `iouring` backend |
 | `--buffer-size` | `100` | Buffer size in GB |
 | `--iterations` | `5` | Iterations per (thread_count, block_size) combination |
 | `--num-blocks` | `1000` | Blocks to transfer (blocks mode only) |
@@ -292,9 +298,9 @@ When CPP doesn't have the exact block size as tunable, uses the closest availabl
 
 ---
 
-## Optuna Auto-Tuner (`optuna_tuner.py`)
+## Optuna Auto-Tuner (`optuna_tuner_threads.py`)
 
-Bayesian optimization to find best `thread_count` and `block_size_mb` per I/O operation mode.
+Bayesian optimization to find best `thread_count` and `block_size_mb` per I/O operation mode for the `threaded_tunable` backend.
 
 ### Architecture
 - Runs 3 sequential studies: write, read, concurrent
@@ -326,11 +332,51 @@ All I/O-level parameters frozen to match cpp defaults (based on experiment findi
 
 ### Usage
 ```bash
-python optuna_tuner.py --preset short    # quick test
-python optuna_tuner.py                   # full optimization
-./scripts/run_optuna_on_lsf.sh           # via LSF
-./scripts/run_optuna_on_lsf.sh short     # quick via LSF
+python optuna_tuner_threads.py --preset short    # quick test
+python optuna_tuner_threads.py                   # full optimization
+./scripts/run_optuna_threads_on_lsf.sh                            # via LSF
+./scripts/run_optuna_threads_on_lsf.sh short                      # quick via LSF
 ```
+
+---
+
+## Optuna Auto-Tuner for iouring (`optuna_tuner_iouring.py`)
+
+Same Bayesian-optimization pattern as the threaded_tunable tuner, but driving the iouring backend. Separate SQLite DB (`results/optuna_iouring_study.db`) so studies don't collide with threaded_tunable ones.
+
+### Active Search Space (first pass)
+- `queue_depth`: int [32, 1024] log-scale — io_uring SQ/CQ ring size
+- `batch_size`:  int [32, 1024] log-scale — SQEs per `io_uring_submit()`
+- `block_size_mb`: categorical [2, 4, 8, 16, 32, 64, 128]
+
+### Frozen Parameters (defaults for first pass)
+`use_sqpoll=False, use_direct=False, use_registered_files=False, use_registered_buffers=False`
+— Python config surface covers these, but C++ setters are not yet implemented in `iouring_utils.cpp`. Unfreezing requires C++ work per [docs/iouring_implementation_plan.md](docs/iouring_implementation_plan.md).
+
+### Modes
+Three studies — `iouring_write`, `iouring_read`, `iouring_concurrent` — driven by the iouring branches in `run_benchmark_iteration` and `run_concurrent_benchmark_iteration`.
+
+### Presets
+
+| Preset | Trials/mode | Data/trial | Buffer | Cleaning | Iter | Wall time | Purpose |
+|--------|------------|-----------|--------|----------|------|-----------|---------|
+| `short` | 10 | 0.5GB | 1GB | 2GB | 1 | ~1-2 min | Pipeline validation. Reported GB/s is inflated (cache not flushed). |
+| `full` | 250 | 10GB | 100GB | 100GB | 3 | hours | Real optimization. Full 100GB cache flush. |
+
+### Usage
+```bash
+# Requires: kernel.io_uring_disabled=0 (sudo sysctl -w if needed)
+python optuna_tuner_iouring.py --preset short --n-trials 5   # quick smoke (~2-4 min)
+python optuna_tuner_iouring.py --preset short                # ~5-10 min
+python optuna_tuner_iouring.py                               # full preset
+
+# Convenience wrapper (no LSF — runs on current host, checks sysctl first)
+./scripts/run_optuna_iouring.sh short 5    # smoke
+./scripts/run_optuna_iouring.sh short      # short preset
+./scripts/run_optuna_iouring.sh            # full preset
+```
+
+Output: `results/best_iouring_config_{ts}.json` with per-mode best configs.
 
 ---
 
