@@ -2,6 +2,11 @@
 
 import os
 import torch
+from dotenv import load_dotenv
+
+# Load .env from project root (or cwd walking up). Does not override existing env vars,
+# so shell exports / run_benchmark_on_lsf.sh's `source .env` / pod env still win.
+load_dotenv()
 
 # Storage path configuration - can be overridden by STORAGE_PATH environment variable
 STORAGE_PATH = os.environ.get('STORAGE_PATH', '/dev/shm')
