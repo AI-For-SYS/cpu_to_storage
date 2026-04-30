@@ -1,6 +1,6 @@
 #!/bin/bash
-# Usage: ./scripts/run_optuna_on_lsf.sh              (full preset, default)
-#        ./scripts/run_optuna_on_lsf.sh short         (quick sanity check)
+# Usage: ./scripts/run_optuna_threads_on_lsf.sh              (full preset, default)
+#        ./scripts/run_optuna_threads_on_lsf.sh short         (quick sanity check)
 
 source "$(dirname "$0")/../.env"
 
@@ -13,4 +13,4 @@ bsub -J "optuna_${PRESET}" \
      -R "span[hosts=1]" \
      -gpu "num=1" \
      -q normal \
-     bash "${PROJ_DIR}/scripts/optuna_job.sh" "$PRESET"
+     bash "${PROJ_DIR}/scripts/optuna_threads_job.sh" "$PRESET"

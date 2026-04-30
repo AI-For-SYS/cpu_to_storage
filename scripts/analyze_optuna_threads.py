@@ -1,10 +1,11 @@
 """
-Analyze an Optuna study DB after-the-fact.
+Analyze a threaded_tunable Optuna study DB after-the-fact.
 
 Usage:
-    python scripts/analyze_optuna.py [path/to/optuna_study.db]
+    python scripts/analyze_optuna_threads.py [path/to/optuna_study.db]
 
-Loads the write/read/concurrent studies from the given SQLite DB and prints:
+Loads the write/read/concurrent studies (study name prefix `threaded_tunable_`)
+from the given SQLite DB and prints:
   - Trial count (completed / pruned / failed)
   - Best trial and its parameters
   - fANOVA parameter importance (requires scikit-learn)

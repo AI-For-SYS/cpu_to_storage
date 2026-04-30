@@ -6,9 +6,9 @@ I/O parameters for each operation on a given storage system.
 Exports a single config file with best params for all three modes.
 
 Usage:
-    python optuna_tuner.py                              # full preset (default)
-    python optuna_tuner.py --preset short               # quick sanity check
-    python optuna_tuner.py --n-trials 500               # override trial count per mode
+    python optuna_tuner_threads.py                              # full preset (default)
+    python optuna_tuner_threads.py --preset short               # quick sanity check
+    python optuna_tuner_threads.py --n-trials 500               # override trial count per mode
 """
 
 import argparse
@@ -25,7 +25,7 @@ import torch
 from backends.threaded_tunable_backend import (
     ThreadedTunableConfig, FadviseHint, SyncStrategy,
     configure, threaded_tunable_write_blocks, threaded_tunable_read_blocks,
-    save_tunable_configs,
+    save_threads_configs,
 )
 from utils.config import STORAGE_PATH, PIN_MEMORY
 from utils.file_utils import generate_dest_file_names, clean_files
@@ -437,7 +437,7 @@ def main():
         print_study_summary(studies[mode], mode)
 
     # Export combined config
-    save_tunable_configs(
+    save_threads_configs(
         export_path,
         write_config=best_configs["write"],
         read_config=best_configs["read"],
