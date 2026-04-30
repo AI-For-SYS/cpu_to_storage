@@ -78,6 +78,9 @@ def plot_experiment(cpp_data, tunable_data, cpp_concurrent=None, output_dir="plo
     cpp_config = cpp_data.get("config", {})
     tunable_config = tunable_data.get("config", {})
     total_gb = cpp_config.get("total_data_size_gb", "?")
+    # Backend label for title / filename (e.g. "threaded_tunable" or "iouring").
+    # Falls back to a generic label if the JSON predates the field.
+    backend_label = tunable_config.get("implementation", "tunable")
 
     # Extract tunable configs
     write_cfg = tunable_config.get("tunable_write_config", {})
@@ -140,16 +143,15 @@ def plot_experiment(cpp_data, tunable_data, cpp_concurrent=None, output_dir="plo
     storage = cpp_config.get("file_system", "unknown")
     iterations = cpp_config.get("num_iterations", "?")
     fig.suptitle(
-        f"CPP vs Threaded Tunable — {total_gb}GB, {iterations} iterations\n"
+        f"CPP vs {backend_label} (tuned) — {total_gb}GB, {iterations} iterations\n"
         f"Cluster: {cluster} | Storage: {storage}",
         fontsize=13, y=1.02
     )
 
     plt.tight_layout()
 
-    # Save
-    ts = tunable_data.get("config", {}).get("total_data_size_gb", "")
-    output_path = os.path.join(output_dir, f"comparison_{total_gb}gb.png")
+    # Save — backend in filename so multiple backends' plots can coexist
+    output_path = os.path.join(output_dir, f"comparison_cpp_vs_{backend_label}_{total_gb}gb.png")
     fig.savefig(output_path, dpi=150, bbox_inches="tight")
     print(f"Saved: {output_path}")
     plt.close()
