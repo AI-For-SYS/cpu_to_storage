@@ -1,4 +1,6 @@
 .vscode/sftp.json
+.vscode/sftp_ccc.json
+.claude/
 .env
 .env_*
 .venv/

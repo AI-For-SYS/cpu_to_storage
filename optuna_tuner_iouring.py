@@ -1,14 +1,21 @@
 """
-Optuna auto-tuner for threaded_tunable backend.
+Optuna auto-tuner for iouring backend.
 
 Runs three sequential studies (write, read, concurrent) to find optimal
-I/O parameters for each operation on a given storage system.
+io_uring parameters for each operation on a given storage system.
 Exports a single config file with best params for all three modes.
 
+First-pass search space: queue_depth, batch_size, block_size_mb.
+Frozen at defaults: use_sqpoll, use_direct, use_registered_files, use_registered_buffers
+(C++ setters for these are not yet implemented; see docs/iouring_implementation_plan.md).
+
 Usage:
-    python optuna_tuner.py                              # full preset (default)
-    python optuna_tuner.py --preset short               # quick sanity check
-    python optuna_tuner.py --n-trials 500               # override trial count per mode
+    python optuna_tuner_iouring.py                              # full preset (default)
+    python optuna_tuner_iouring.py --preset short               # quick sanity check
+    python optuna_tuner_iouring.py --preset short --n-trials 5  # ultra-quick smoke (~2-4 min)
+    python optuna_tuner_iouring.py --n-trials 500               # override trial count per mode
+
+Requires: kernel.io_uring_disabled=0 (sudo sysctl -w if needed).
 """
 
 import argparse
@@ -22,10 +29,12 @@ from datetime import datetime
 import optuna
 import torch
 
-from backends.threaded_tunable_backend import (
-    ThreadedTunableConfig, FadviseHint, SyncStrategy,
-    configure, threaded_tunable_write_blocks, threaded_tunable_read_blocks,
-    save_tunable_configs,
+from backends.iouring_backend import (
+    IouringTunableConfig,
+    configure as iouring_configure,
+    iouring_write_blocks, iouring_read_blocks,
+    save_iouring_tunable_configs,
+    IOURING_AVAILABLE,
 )
 from utils.config import STORAGE_PATH, PIN_MEMORY
 from utils.file_utils import generate_dest_file_names, clean_files
@@ -34,11 +43,15 @@ from utils.file_utils import generate_dest_file_names, clean_files
 # Presets
 # ============================================================================
 PRESETS = {
+    # short: pipeline validation only — ~1-2 min wall time. Cache is NOT fully
+    # flushed (cleaning_gb=2), so reported GB/s are artificially high on systems
+    # with >2GB free RAM. Use `full` for trustworthy numbers.
     "short": {
-        "n_trials": 20,
+        "n_trials": 10,
         "timeout_per_mode": 300,
-        "data_gb": 1,
+        "data_gb": 0.5,
         "buffer_gb": 1,
+        "cleaning_gb": 2,
         "iterations": 1,
         "block_sizes_mb": [4, 8, 16, 32],
         "n_startup_trials": 5,
@@ -48,6 +61,7 @@ PRESETS = {
         "timeout_per_mode": None,
         "data_gb": 10,
         "buffer_gb": 100,
+        "cleaning_gb": 100,
         "iterations": 3,
         "block_sizes_mb": [2, 4, 8, 16, 32, 64, 128],
         "n_startup_trials": 30,
@@ -64,8 +78,15 @@ _cleaning_indices = None
 _cleaning_block_size = None
 
 
-def allocate_trial_buffers(buffer_gb):
-    """Allocate buffers once for all trials."""
+def allocate_trial_buffers(buffer_gb, cleaning_gb):
+    """Allocate buffers once for all trials.
+
+    cleaning_gb controls how much unrelated data is read between trials to
+    flush the OS page cache. For trustworthy read-throughput numbers on
+    machines with >Nx GB free RAM, cleaning_gb should exceed that. The
+    `short` preset uses a small value (e.g. 2GB) for pipeline validation
+    only — reported GB/s will be inflated because the cache isn't flushed.
+    """
     global _buffer, _buffer_cleaning
     global _cleaning_files, _cleaning_indices, _cleaning_block_size
 
@@ -75,12 +96,9 @@ def allocate_trial_buffers(buffer_gb):
     print("Allocating buffers...")
     _buffer = torch.zeros(num_elements, dtype=torch.float16, device='cpu', pin_memory=PIN_MEMORY)
 
-    # Cleaning buffer: must match original benchmark — 100GB
-    # Original allocates 50B float16 elements = 100GB buffer, 3200 × 32MB files = 100GB reads
-    # This is needed to reliably flush page cache on machines with 200+ GB RAM
-    _cleaning_block_size = 32 * 1024 * 1024  # 32MB
-    num_cleaning_blocks = 3200               # 3200 × 32MB = 100GB
-    cleaning_size = num_cleaning_blocks * _cleaning_block_size  # 100GB
+    _cleaning_block_size = 32 * 1024 * 1024  # 32MB per cleaning file
+    num_cleaning_blocks = max(1, (cleaning_gb * 1024) // 32)   # cleaning_gb → N × 32MB blocks
+    cleaning_size = num_cleaning_blocks * _cleaning_block_size
     cleaning_elements = cleaning_size // 2   # float16 = 2 bytes
     _buffer_cleaning = torch.zeros(cleaning_elements, dtype=torch.float16, device='cpu', pin_memory=PIN_MEMORY)
 
@@ -88,18 +106,18 @@ def allocate_trial_buffers(buffer_gb):
     _cleaning_indices = list(range(num_cleaning_blocks))
 
     # Pre-write cleaning files
-    print("Pre-writing cache cleaning files to /dev/shm (100GB)...")
+    print(f"Pre-writing cache cleaning files to /dev/shm ({cleaning_gb}GB)...")
     asyncio.get_event_loop().run_until_complete(
-        threaded_tunable_write_blocks(
+        iouring_write_blocks(
             _cleaning_block_size, _buffer_cleaning, _cleaning_indices, _cleaning_files
         )
     )
-    print(f"Buffers allocated ({buffer_gb}GB main, 100GB cleaning)\n")
+    print(f"Buffers allocated ({buffer_gb}GB main, {cleaning_gb}GB cleaning)\n")
 
 
 async def _clean_cache():
     """Read cleaning files to evict page cache."""
-    await threaded_tunable_read_blocks(
+    await iouring_read_blocks(
         _cleaning_block_size, _buffer_cleaning, _cleaning_indices, _cleaning_files
     )
 
@@ -122,7 +140,7 @@ async def _run_write_trial(block_size_mb, data_gb, iterations):
     for i in range(iterations):
         clean_files(file_names)
         block_indices = random.sample(range(max_block_index), num_blocks)
-        elapsed = await threaded_tunable_write_blocks(
+        elapsed = await iouring_write_blocks(
             block_size, _buffer, block_indices, file_names
         )
         times.append(elapsed)
@@ -149,14 +167,14 @@ async def _run_read_trial(block_size_mb, data_gb, iterations):
 
     # Write files once (setup, not measured)
     clean_files(file_names)
-    await threaded_tunable_write_blocks(
+    await iouring_write_blocks(
         block_size, _buffer, block_indices, file_names
     )
 
     times = []
     for i in range(iterations):
         await _clean_cache()
-        elapsed = await threaded_tunable_read_blocks(
+        elapsed = await iouring_read_blocks(
             block_size, _buffer, block_indices, file_names
         )
         times.append(elapsed)
@@ -183,7 +201,7 @@ async def _run_concurrent_trial(block_size_mb, data_gb, iterations):
 
     # Pre-write read files (setup)
     read_indices = random.sample(range(half_max, max_block_index), num_half)
-    await threaded_tunable_write_blocks(
+    await iouring_write_blocks(
         block_size, _buffer, read_indices, file_names_read
     )
 
@@ -195,10 +213,10 @@ async def _run_concurrent_trial(block_size_mb, data_gb, iterations):
         write_indices = random.sample(range(0, half_max), num_half)
 
         start = time.perf_counter()
-        write_task = threaded_tunable_write_blocks(
+        write_task = iouring_write_blocks(
             block_size, _buffer, write_indices, file_names_write
         )
-        read_task = threaded_tunable_read_blocks(
+        read_task = iouring_read_blocks(
             block_size, _buffer, read_indices, file_names_read
         )
         await asyncio.gather(write_task, read_task)
@@ -234,36 +252,31 @@ def create_objective(mode, data_gb, iterations, block_sizes_mb):
         """Single Optuna trial. Returns throughput in GB/s (maximize)."""
 
         # --- Explored parameters (Optuna samples these) ---
-        thread_count = trial.suggest_int("thread_count", 4, 128, log=True)
+        queue_depth = trial.suggest_int("queue_depth", 32, 1024, log=True)
+        batch_size = trial.suggest_int("batch_size", 32, 1024, log=True)
         block_size_mb = trial.suggest_categorical("block_size_mb", block_sizes_mb)
 
-        # --- Frozen parameters (matching cpp baseline behavior) ---
-        # io_chunk_kb=0 and fadvise=normal match what cpp uses (no chunking, no hints)
-        # Previous runs showed these I/O hints don't help on GPFS
-        io_chunk_kb = 0                        # no chunking, same as cpp
-        fadvise_hint = FadviseHint.NORMAL      # no hints, same as cpp
-        prefetch_depth = 0
-        o_direct = False
-        cpu_affinity = False
-        o_noatime = False                      # same as cpp (no special flags)
-        fallocate = False
-        sync_strategy = SyncStrategy.NONE
+        # --- Frozen parameters (defaults for first pass) ---
+        # C++ setters for these are not yet implemented in iouring_utils.cpp.
+        # See docs/iouring_implementation_plan.md (Tunable Parameters section).
+        use_sqpoll = False
+        use_direct = False
+        use_registered_files = False
+        use_registered_buffers = False
 
-        config = ThreadedTunableConfig(
-            thread_count=thread_count,
-            o_direct=o_direct,
-            fadvise_hint=fadvise_hint,
-            io_chunk_kb=io_chunk_kb,
-            cpu_affinity=cpu_affinity,
-            o_noatime=o_noatime,
-            prefetch_depth=prefetch_depth,
-            fallocate=fallocate,
-            sync_strategy=sync_strategy,
+        config = IouringTunableConfig(
+            queue_depth=queue_depth,
+            batch_size=batch_size,
+            block_size_mb=block_size_mb,
+            use_sqpoll=use_sqpoll,
+            use_direct=use_direct,
+            use_registered_files=use_registered_files,
+            use_registered_buffers=use_registered_buffers,
         )
 
         # Apply config
         try:
-            configure(config)
+            iouring_configure(config)
         except RuntimeError as e:
             print(f"  [SKIP] Config error: {e}")
             raise optuna.TrialPruned()
@@ -276,13 +289,10 @@ def create_objective(mode, data_gb, iterations, block_sizes_mb):
             raise optuna.TrialPruned()
 
         # Calculate throughput
-        if mode == "concurrent":
-            throughput = data_gb / elapsed  # total data (write + read halves)
-        else:
-            throughput = data_gb / elapsed
+        throughput = data_gb / elapsed
 
         # Log (only explored params)
-        params_str = f"threads={config.thread_count} block={block_size_mb}MB"
+        params_str = f"qd={queue_depth} batch={batch_size} block={block_size_mb}MB"
         print(f"  Trial {trial.number:4d} | {throughput:7.2f} GB/s | {params_str}")
 
         return throughput
@@ -303,13 +313,13 @@ def run_study(mode, preset, n_trials_override, timeout_override):
     n_startup = preset["n_startup_trials"]
 
     print(f"\n{'='*60}")
-    print(f"  Study: {mode} optimization")
+    print(f"  Study: iouring_{mode} optimization")
     timeout_str = f"{timeout}s" if timeout else "none"
     print(f"  Trials: {n_trials}, Timeout: {timeout_str}, Data: {data_gb}GB, Iterations: {iterations}")
     print(f"{'='*60}\n")
 
     study = optuna.create_study(
-        study_name=f"threaded_tunable_{mode}",
+        study_name=f"iouring_{mode}",
         direction="maximize",
         sampler=optuna.samplers.TPESampler(
             n_startup_trials=n_startup,
@@ -319,7 +329,7 @@ def run_study(mode, preset, n_trials_override, timeout_override):
             n_startup_trials=n_startup // 2,
             n_warmup_steps=0,
         ),
-        storage="sqlite:///results/optuna_study.db",
+        storage="sqlite:///results/optuna_iouring_study.db",
         load_if_exists=True,
     )
 
@@ -336,7 +346,7 @@ def run_study(mode, preset, n_trials_override, timeout_override):
 def print_study_summary(study, mode):
     """Print summary for a single study."""
     best = study.best_trial
-    print(f"\n  Best {mode} trial (#{best.number}): {best.value:.2f} GB/s")
+    print(f"\n  Best iouring_{mode} trial (#{best.number}): {best.value:.2f} GB/s")
     for key, value in best.params.items():
         print(f"    {key}: {value}")
 
@@ -350,19 +360,16 @@ def print_study_summary(study, mode):
 
 
 def extract_best_config(study):
-    """Extract ThreadedTunableConfig from study's best trial."""
+    """Extract IouringTunableConfig from study's best trial."""
     params = study.best_trial.params
-    return ThreadedTunableConfig(
-        thread_count=params.get("thread_count", 0),
+    return IouringTunableConfig(
+        queue_depth=params.get("queue_depth", 256),
+        batch_size=params.get("batch_size", 256),
         block_size_mb=params.get("block_size_mb", 0),
-        o_direct=params.get("o_direct", False),
-        fadvise_hint=FadviseHint(params.get("fadvise_hint", "normal")),
-        io_chunk_kb=params.get("io_chunk_kb", 0),
-        cpu_affinity=params.get("cpu_affinity", False),
-        o_noatime=params.get("o_noatime", False),
-        prefetch_depth=params.get("prefetch_depth", 0),
-        fallocate=params.get("fallocate", False),
-        sync_strategy=SyncStrategy(params.get("sync_strategy", "none")),
+        use_sqpoll=params.get("use_sqpoll", False),
+        use_direct=params.get("use_direct", False),
+        use_registered_files=params.get("use_registered_files", False),
+        use_registered_buffers=params.get("use_registered_buffers", False),
     )
 
 
@@ -371,11 +378,11 @@ def extract_best_config(study):
 # ============================================================================
 def main():
     parser = argparse.ArgumentParser(
-        description="Optuna auto-tuner for threaded_tunable I/O backend"
+        description="Optuna auto-tuner for iouring I/O backend"
     )
     parser.add_argument(
         "--preset", type=str, default="full", choices=["short", "full"],
-        help="Preset config: short (20 trials/mode, 1GB) or full (200 trials/mode, 10GB)"
+        help="Preset config: short (20 trials/mode, 1GB) or full (250 trials/mode, 10GB)"
     )
     parser.add_argument(
         "--n-trials", type=int, default=None,
@@ -387,16 +394,21 @@ def main():
     )
     parser.add_argument(
         "--export-config", type=str, default=None,
-        help="Path to save best config JSON (default: results/best_config_{timestamp}.json)"
+        help="Path to save best config JSON (default: results/best_iouring_config_{timestamp}.json)"
     )
     args = parser.parse_args()
 
+    if not IOURING_AVAILABLE:
+        print("Error: iouring backend not available.")
+        print("Check 'kernel.io_uring_disabled' (should be 0) and that iouring_ext is built.")
+        sys.exit(1)
+
     preset = PRESETS[args.preset]
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-    export_path = args.export_config or f"results/best_config_{ts}.json"
+    export_path = args.export_config or f"results/best_iouring_config_{ts}.json"
 
     print("=" * 60)
-    print("OPTUNA AUTO-TUNER")
+    print("OPTUNA AUTO-TUNER (iouring)")
     print("=" * 60)
     print(f"Preset:          {args.preset}")
     print(f"Trials/mode:     {args.n_trials or preset['n_trials']}")
@@ -404,6 +416,7 @@ def main():
     print(f"Timeout/mode:    {f'{timeout_val}s' if timeout_val else 'none'}")
     print(f"Data/trial:      {preset['data_gb']}GB")
     print(f"Buffer:          {preset['buffer_gb']}GB")
+    print(f"Cleaning:        {preset['cleaning_gb']}GB")
     print(f"Iterations:      {preset['iterations']}")
     print(f"Block sizes:     {preset['block_sizes_mb']} MB")
     print(f"Storage path:    {STORAGE_PATH}")
@@ -411,13 +424,13 @@ def main():
     print("=" * 60)
 
     # Allocate buffers once for all studies
-    allocate_trial_buffers(preset["buffer_gb"])
+    allocate_trial_buffers(preset["buffer_gb"], preset["cleaning_gb"])
     os.makedirs("results", exist_ok=True)
 
     # Run all three studies sequentially
     studies = {}
     best_configs = {}
-    metadata = {"storage_path": STORAGE_PATH}
+    metadata = {"storage_path": STORAGE_PATH, "backend": "iouring"}
 
     for mode in ("write", "read", "concurrent"):
         study = run_study(mode, preset, args.n_trials, args.timeout)
@@ -431,13 +444,13 @@ def main():
 
     # Print final summary
     print(f"\n{'='*60}")
-    print("OPTIMIZATION COMPLETE")
+    print("OPTIMIZATION COMPLETE (iouring)")
     print("=" * 60)
     for mode in ("write", "read", "concurrent"):
         print_study_summary(studies[mode], mode)
 
     # Export combined config
-    save_tunable_configs(
+    save_iouring_tunable_configs(
         export_path,
         write_config=best_configs["write"],
         read_config=best_configs["read"],

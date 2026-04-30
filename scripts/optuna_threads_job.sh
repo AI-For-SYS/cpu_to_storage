@@ -1,5 +1,5 @@
 #!/bin/bash
-# Optuna tuning job script — called by run_optuna_on_lsf.sh via LSF
+# Optuna tuning job script — called by run_optuna_threads_on_lsf.sh via LSF
 
 source "$(dirname "$0")/../.env"
 
@@ -17,4 +17,4 @@ echo "Storage path: $STORAGE_PATH"
 echo "Working dir: $(pwd)"
 echo "==="
 
-python optuna_tuner.py --preset $PRESET
+python optuna_tuner_threads.py --preset $PRESET
